@@ -1,9 +1,23 @@
 <script lang="ts">
-	import { fetchBranches, type BranchList, type Project, type Target } from './lib/api';
+	import PlanEditor from './PlanEditor.svelte';
+	import { fetchBranches, type BranchList, type ClaudeSummary, type Plan, type PlanPatch, type Project, type Target } from './lib/api';
 	import { ago } from './lib/time';
 
-	type Props = { p: Project; now: number; onclose: () => void; onact: (t: Target) => void };
-	let { p, now, onclose, onact }: Props = $props();
+	type Props = {
+		p: Project;
+		plan: Plan | undefined;
+		claude: ClaudeSummary | undefined;
+		now: number;
+		onclose: () => void;
+		onact: (t: Target) => void;
+		onsave: (patch: PlanPatch) => Promise<unknown>;
+	};
+	let { p, plan, claude, now, onclose, onact, onsave }: Props = $props();
+
+	let editor = $state<ReturnType<typeof PlanEditor>>();
+	export const focusNext = () => editor?.focusNext();
+	export const focusTask = () => editor?.focusTask();
+	export const focusNotes = () => editor?.focusNotes();
 
 	const id = $derived(p.rel);
 	const activity = $derived(p.last_activity);
@@ -62,6 +76,8 @@
 		<button onclick={() => onact('folder')}><kbd>o</kbd> Folder</button>
 		{#if p.web_url}<button onclick={() => onact('github')}><kbd>g</kbd> Remote</button>{/if}
 	</div>
+
+	<PlanEditor bind:this={editor} rel={p.rel} {plan} {claude} {now} {onsave} />
 
 	{#if p.kind === 'git'}
 		<h3>

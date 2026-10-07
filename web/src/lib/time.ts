@@ -21,3 +21,9 @@ export function freshness(iso: string | undefined, now: number): 'hot' | 'warm' 
 	const d = now - t;
 	return d < 2 * DAY ? 'hot' : d < 14 * DAY ? 'warm' : 'cold';
 }
+
+export function bytes(n: number | undefined): string {
+	if (!n) return '—';
+	if (n < 1 << 30) return `${Math.round(n / (1 << 20))} MB`;
+	return `${(n / (1 << 30)).toFixed(1)} GB`;
+}

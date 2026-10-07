@@ -1,3 +1,12 @@
+export type Command = {
+	name: string;
+	run: string;
+	dir?: string;
+	source: string;
+	keys?: boolean; // single-key input: flutter r / R
+	url?: string;
+};
+
 export type Project = {
 	path: string;
 	rel: string; // stable id
@@ -20,14 +29,80 @@ export type Project = {
 	worktrees?: number;
 	web_url?: string;
 	risks?: string[];
+	commands?: Command[];
+	default_command?: string;
+};
+
+export type Stack = { name: string; dir: string; run?: string; commands?: string[]; source: string };
+
+export type Status = 'idea' | 'active' | 'paused' | 'shipped' | 'dead';
+export type Task = { text: string; done?: boolean };
+export type PlanLog = { at: string; by?: string; text: string };
+export type Plan = {
+	status?: Status;
+	priority?: number; // 1 high … 3 low
+	next?: string;
+	notes?: string;
+	tasks?: Task[];
+	log?: PlanLog[];
+	updated?: string;
+};
+export type PlanPatch = {
+	status?: Status | '';
+	priority?: number;
+	next?: string;
+	notes?: string;
+	tasks?: Task[];
+	note?: string;
+};
+
+export type ClaudeSummary = { last_at: string; last_title: string; live?: boolean; sessions_7d?: number; mins_7d?: number };
+export type ClaudeSession = {
+	id: string;
+	title: string;
+	branch?: string;
+	start: string;
+	end: string;
+	prompts: number;
+	active_mins: number;
 };
 
 export type Snapshot = {
 	root: string;
 	scanned_at: string;
 	scanning: boolean;
+	config_path: string;
+	config_error?: string;
 	projects: Project[];
+	stacks: Stack[];
+	plans: Record<string, Plan>;
+	plans_path: string;
+	plans_error?: string;
+	claude: Record<string, ClaudeSummary>;
 };
+
+export type Proc = {
+	id: string;
+	project?: string;
+	name: string;
+	run: string;
+	dir: string;
+	keys?: boolean;
+	status: 'running' | 'stopping' | 'exited' | 'orphan';
+	exit_code: number;
+	started_at: string;
+	ended_at?: string;
+	pid?: number;
+	rss_bytes?: number;
+	ports?: number[];
+	urls?: string[];
+	warning?: string;
+	stopped?: boolean;
+};
+
+export type ProcsEvent = { procs: Proc[]; mem_total: number; mem_available: number };
+
+export const isAlive = (p: Proc) => p.status !== 'exited';
 
 export type Branch = {
 	name: string;
@@ -55,21 +130,36 @@ async function post(url: string, body: unknown) {
 		body: JSON.stringify(body)
 	});
 	if (!r.ok) throw new Error((await r.text()).trim() || r.statusText);
+	return r;
 }
 
-export const openIn = (id: string, target: Target) => post('/api/open', { id, target });
-export const rescan = () => post('/api/rescan', {});
-
-export async function fetchBranches(id: string): Promise<BranchList> {
-	const r = await fetch('/api/branches?id=' + encodeURIComponent(id));
+async function get<T>(url: string): Promise<T> {
+	const r = await fetch(url);
 	if (!r.ok) throw new Error((await r.text()).trim() || r.statusText);
 	return r.json();
 }
 
+export const openIn = (id: string, target: Target) => post('/api/open', { id, target });
+export const rescan = () => post('/api/rescan', {});
+export const startCommand = (project: string, command?: string) => post('/api/procs/start', { project, command });
+export const startStack = (stack: string) => post('/api/procs/start', { stack });
+export const procAction = (action: 'stop' | 'restart' | 'remove' | 'input', id: string, data?: string) =>
+	post('/api/procs/' + action, { id, data });
+
+export const fetchBranches = (id: string) => get<BranchList>('/api/branches?id=' + encodeURIComponent(id));
+export const fetchSessions = (id: string) => get<ClaudeSession[]>('/api/claude?id=' + encodeURIComponent(id));
+export const updatePlan = async (project: string, patch: PlanPatch): Promise<Plan> =>
+	(await post('/api/plan', { project, patch })).json();
+
 /** Live snapshots over SSE. EventSource reconnects on its own after errors. */
-export function subscribe(onSnapshot: (s: Snapshot) => void, onConnection: (up: boolean) => void) {
+export function subscribe(
+	onSnapshot: (s: Snapshot) => void,
+	onProcs: (p: ProcsEvent) => void,
+	onConnection: (up: boolean) => void
+) {
 	const es = new EventSource('/api/events');
 	es.addEventListener('snapshot', (e) => onSnapshot(JSON.parse((e as MessageEvent).data)));
+	es.addEventListener('procs', (e) => onProcs(JSON.parse((e as MessageEvent).data)));
 	es.onopen = () => onConnection(true);
 	es.onerror = () => onConnection(false);
 	return () => es.close();

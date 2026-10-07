@@ -20,6 +20,11 @@
 	--shadow: 0 1px 2px rgb(20 24 32 / 0.06), 0 2px 8px rgb(20 24 32 / 0.04);
 	--mono: ui-monospace, 'JetBrains Mono', 'Fira Code', Menlo, monospace;
 	--sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Ubuntu, sans-serif;
+	--term-bg: #fbfaf7;
+	--term-fg: #1d2330;
+	--term-sel: #f0d9b0;
+	--running: #2f9e5b;
+	--orphan: #8a5cd6;
 	color-scheme: light;
 }
 
@@ -44,6 +49,11 @@
 		--info-soft: #1f2a42;
 		--chip: #262c38;
 		--shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+		--term-bg: #0e1116;
+		--term-fg: #d8dbe2;
+		--term-sel: #3a2e1c;
+		--running: #4cc27e;
+		--orphan: #b48ef5;
 		color-scheme: dark;
 	}
 }
@@ -68,6 +78,11 @@
 	--info-soft: #1f2a42;
 	--chip: #262c38;
 	--shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+	--term-bg: #0e1116;
+	--term-fg: #d8dbe2;
+	--term-sel: #3a2e1c;
+	--running: #4cc27e;
+	--orphan: #b48ef5;
 	color-scheme: dark;
 }
 
@@ -109,4 +124,22 @@ button {
 ::-webkit-scrollbar-thumb {
 	background: var(--line);
 	border-radius: 5px;
+}
+
+/* Plan status colours: components use var(--st). */
+.st-idea {
+	--st: var(--info);
+}
+.st-active {
+	--st: var(--running);
+}
+.st-paused {
+	--st: var(--warm);
+}
+.st-shipped {
+	--st: var(--orphan);
+}
+.st-dead,
+.st-none {
+	--st: var(--faint);
 }

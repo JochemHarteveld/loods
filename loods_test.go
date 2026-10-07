@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 )
 
@@ -42,7 +43,7 @@ func TestParseTrack(t *testing.T) {
 }
 
 func TestGuard(t *testing.T) {
-	s := newServer(t.TempDir(), t.TempDir(), 1, 7777)
+	s := newServer(t.TempDir(), t.TempDir(), 1, 7777, filepath.Join(t.TempDir(), "procs.json"))
 	h := s.handler()
 	cases := []struct {
 		name, method, host, header string

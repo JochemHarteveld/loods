@@ -63,8 +63,11 @@ type Item struct {
 	Branches   int       `json:"branches,omitempty"`
 	Worktrees  int       `json:"worktrees,omitempty"` // linked worktrees, not counting the main checkout
 	WebURL     string    `json:"web_url,omitempty"`
-	Risks      []string  `json:"risks,omitempty"`
-	Dupes      []string  `json:"possible_duplicates,omitempty"`
+	Commands   []Command `json:"commands,omitempty"`
+	// DefaultCommand is what r starts without asking (config default, else the first).
+	DefaultCommand string   `json:"default_command,omitempty"`
+	Risks          []string `json:"risks,omitempty"`
+	Dupes          []string `json:"possible_duplicates,omitempty"`
 
 	Scanned bool `json:"-"`
 	Gone    bool `json:"-"`
@@ -197,6 +200,7 @@ type scanResult struct {
 	size     int64
 	lastFile time.Time
 	stack    []string
+	commands []Command
 	git      *gitInfo
 }
 
@@ -211,6 +215,7 @@ func scan(it *Item, withSize bool) scanResult {
 	dirStats(it.Path, false, withSize, &r.size, &r.lastFile)
 	if it.Kind == KindGit || it.Kind == KindProj {
 		r.stack = detectStack(it.Path)
+		r.commands = detectCommands(it.Path)
 	}
 	if it.Kind == KindGit {
 		g := readGit(it.Path)
@@ -422,7 +427,7 @@ func stackAt(dir string) []string {
 }
 
 func (it *Item) apply(r scanResult) {
-	it.SizeBytes, it.LastFile, it.Stack = r.size, r.lastFile, r.stack
+	it.SizeBytes, it.LastFile, it.Stack, it.Commands = r.size, r.lastFile, r.stack, r.commands
 	if g := r.git; g != nil {
 		it.LastCommit, it.Branch, it.Dirty = g.lastCommit, g.branch, g.dirty
 		it.Unpushed, it.HasRemote, it.Stashes = g.unpushed, g.hasRemote, g.stashes
