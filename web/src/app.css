@@ -1,0 +1,112 @@
+:root {
+	--bg: #f4f2ee;
+	--panel: #fbfaf7;
+	--card: #ffffff;
+	--card-hover: #fdfcf9;
+	--line: #e3dfd6;
+	--text: #1d2330;
+	--muted: #6b7180;
+	--faint: #9aa0ad;
+	--accent: #c47a14;
+	--accent-soft: #f6e6cc;
+	--hot: #2f9e5b;
+	--warm: #d49a1c;
+	--cold: #a3a8b3;
+	--danger: #c8463d;
+	--danger-soft: #f8e1df;
+	--info: #3b6fd6;
+	--info-soft: #e1e9fa;
+	--chip: #efece5;
+	--shadow: 0 1px 2px rgb(20 24 32 / 0.06), 0 2px 8px rgb(20 24 32 / 0.04);
+	--mono: ui-monospace, 'JetBrains Mono', 'Fira Code', Menlo, monospace;
+	--sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Ubuntu, sans-serif;
+	color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme='light']) {
+		--bg: #12151c;
+		--panel: #171b23;
+		--card: #1c212b;
+		--card-hover: #212733;
+		--line: #2a303c;
+		--text: #e6e8ee;
+		--muted: #969cab;
+		--faint: #6b7180;
+		--accent: #f0b35a;
+		--accent-soft: #3a2e1c;
+		--hot: #4cc27e;
+		--warm: #e3b341;
+		--cold: #5c6270;
+		--danger: #f07167;
+		--danger-soft: #3b2224;
+		--info: #7aa2f7;
+		--info-soft: #1f2a42;
+		--chip: #262c38;
+		--shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+		color-scheme: dark;
+	}
+}
+
+:root[data-theme='dark'] {
+	--bg: #12151c;
+	--panel: #171b23;
+	--card: #1c212b;
+	--card-hover: #212733;
+	--line: #2a303c;
+	--text: #e6e8ee;
+	--muted: #969cab;
+	--faint: #6b7180;
+	--accent: #f0b35a;
+	--accent-soft: #3a2e1c;
+	--hot: #4cc27e;
+	--warm: #e3b341;
+	--cold: #5c6270;
+	--danger: #f07167;
+	--danger-soft: #3b2224;
+	--info: #7aa2f7;
+	--info-soft: #1f2a42;
+	--chip: #262c38;
+	--shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+	color-scheme: dark;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	height: 100%;
+}
+
+body {
+	background: var(--bg);
+	color: var(--text);
+	font: 14px/1.4 var(--sans);
+	-webkit-font-smoothing: antialiased;
+}
+
+kbd {
+	font: 11px var(--mono);
+	padding: 1px 5px;
+	border: 1px solid var(--line);
+	border-bottom-width: 2px;
+	border-radius: 4px;
+	background: var(--card);
+	color: var(--text);
+}
+
+button {
+	font: inherit;
+	color: inherit;
+}
+
+::-webkit-scrollbar {
+	width: 10px;
+}
+::-webkit-scrollbar-thumb {
+	background: var(--line);
+	border-radius: 5px;
+}
