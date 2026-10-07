@@ -460,6 +460,18 @@ type savedProc struct {
 	StartedAt  time.Time `json:"started_at"`
 }
 
+// Running reports whether a project has a live process.
+func (m *Manager) Running(project string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.procs {
+		if p.Project == project && p.alive() {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) save() {
 	m.saveMu.Lock() // one writer: they share the .tmp file
 	defer m.saveMu.Unlock()

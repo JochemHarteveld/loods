@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -83,11 +84,36 @@ func trashItem(it *Item) error {
 	return nil
 }
 
-// runUndo restores the most recent archive batch that still has unrestored entries.
+// runUndo restores the last archived batch from the command line.
 func runUndo(archiveRoot string) error {
-	entries, err := readLog(archiveRoot)
+	batch, results, err := undoArchive(archiveRoot)
 	if err != nil {
-		return fmt.Errorf("no log at %s: %w", filepath.Join(archiveRoot, logName), err)
+		return err
+	}
+	if batch == "" {
+		fmt.Println("nothing to undo (trashed items: restore them from your file manager's trash)")
+		return nil
+	}
+	fmt.Printf("restored batch %s\n", batch)
+	for _, r := range results {
+		if r.OK {
+			fmt.Printf("  ok    %s\n", r.Name)
+		} else {
+			fmt.Printf("  fail  %s: %s\n", r.Name, r.Error)
+		}
+	}
+	return nil
+}
+
+// undoArchive restores the most recent archive batch that still has
+// unrestored entries. An empty batch means there was nothing to undo.
+func undoArchive(archiveRoot string) (string, []OpResult, error) {
+	entries, err := readLog(archiveRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, err
 	}
 	restored := map[string]bool{}
 	for _, e := range entries {
@@ -103,28 +129,64 @@ func runUndo(archiveRoot string) error {
 		}
 	}
 	if batch == "" {
-		fmt.Println("nothing to undo (trashed items: restore them from your file manager's trash)")
-		return nil
+		return "", nil, nil
 	}
-	fmt.Printf("restoring batch %s\n", batch)
+	var results []OpResult
 	for _, e := range entries {
 		if e.Batch != batch || e.Action != "archive" || restored[e.To] {
 			continue
 		}
-		if _, err := os.Lstat(e.From); err == nil {
-			fmt.Printf("  skip  %s (something already exists there)\n", e.From)
-			continue
+		r := OpResult{Name: e.From}
+		switch _, err := os.Lstat(e.From); {
+		case err == nil:
+			r.Error = "something already exists there"
+		case os.MkdirAll(filepath.Dir(e.From), 0o755) != nil:
+			r.Error = "cannot create the parent folder"
+		default:
+			if err := os.Rename(e.To, e.From); err != nil {
+				r.Error = err.Error()
+			} else {
+				r.OK = true
+				appendLog(archiveRoot, LogEntry{Time: time.Now(), Batch: batch, Action: "restore", From: e.To, To: e.From})
+			}
 		}
-		if err := os.MkdirAll(filepath.Dir(e.From), 0o755); err != nil {
-			fmt.Printf("  fail  %s: %v\n", e.From, err)
-			continue
-		}
-		if err := os.Rename(e.To, e.From); err != nil {
-			fmt.Printf("  fail  %s: %v\n", e.From, err)
-			continue
-		}
-		appendLog(archiveRoot, LogEntry{Time: time.Now(), Batch: batch, Action: "restore", From: e.To, To: e.From})
-		fmt.Printf("  ok    %s\n", e.From)
+		results = append(results, r)
 	}
-	return nil
+	return batch, results, nil
+}
+
+// Batch summarises one archive or trash run from graveyard.log.
+type Batch struct {
+	Batch    string    `json:"batch"`
+	Time     time.Time `json:"time"`
+	Action   string    `json:"action"` // archive | trash
+	Items    []string  `json:"items"`  // paths as they were
+	Restored bool      `json:"restored,omitempty"`
+}
+
+// recentBatches lists the newest batches first.
+func recentBatches(archiveRoot string, limit int) []Batch {
+	entries, _ := readLog(archiveRoot)
+	restored := map[string]bool{}
+	for _, e := range entries {
+		if e.Action == "restore" {
+			restored[e.Batch] = true
+		}
+	}
+	var out []Batch
+	index := map[string]int{}
+	for _, e := range entries {
+		if e.Action != "archive" && e.Action != "trash" {
+			continue
+		}
+		i, ok := index[e.Batch]
+		if !ok {
+			i = len(out)
+			index[e.Batch] = i
+			out = append(out, Batch{Batch: e.Batch, Time: e.Time, Action: e.Action, Restored: restored[e.Batch]})
+		}
+		out[i].Items = append(out[i].Items, e.From)
+	}
+	slices.Reverse(out)
+	return out[:min(len(out), limit)]
 }

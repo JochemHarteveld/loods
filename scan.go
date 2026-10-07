@@ -65,9 +65,10 @@ type Item struct {
 	WebURL     string    `json:"web_url,omitempty"`
 	Commands   []Command `json:"commands,omitempty"`
 	// DefaultCommand is what r starts without asking (config default, else the first).
-	DefaultCommand string   `json:"default_command,omitempty"`
-	Risks          []string `json:"risks,omitempty"`
-	Dupes          []string `json:"possible_duplicates,omitempty"`
+	DefaultCommand string    `json:"default_command,omitempty"`
+	Risks          []string  `json:"risks,omitempty"`
+	Warnings       []Warning `json:"warnings,omitempty"`
+	Dupes          []string  `json:"possible_duplicates,omitempty"`
 
 	Scanned bool `json:"-"`
 	Gone    bool `json:"-"`
@@ -194,6 +195,7 @@ type gitInfo struct {
 	branches   int
 	worktrees  int
 	webURL     string
+	hy         hygiene
 }
 
 type scanResult struct {
@@ -291,8 +293,9 @@ func readGit(dir string) gitInfo {
 		}
 	}
 	g.branch, _ = git(dir, "rev-parse", "--abbrev-ref", "HEAD")
-	if s, err := git(dir, "status", "--porcelain"); err == nil {
-		g.dirty = countLines(s)
+	status, statusErr := git(dir, "status", "--porcelain")
+	if statusErr == nil {
+		g.dirty = countLines(status)
 	}
 	remotes, _ := git(dir, "remote")
 	g.hasRemote = remotes != ""
@@ -322,6 +325,7 @@ func readGit(dir string) gitInfo {
 		}
 		g.webURL = webURL(url)
 	}
+	g.hy = readHygiene(dir, status, &g)
 	return g
 }
 
@@ -436,6 +440,9 @@ func (it *Item) apply(r scanResult) {
 	}
 	it.Scanned = true
 	it.finalize()
+	if r.git != nil {
+		it.Warnings = it.warnings(r.git.hy, time.Now())
+	}
 }
 
 // finalize derives Activity and Risks from the raw scan fields.

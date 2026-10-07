@@ -24,6 +24,13 @@ export function freshness(iso: string | undefined, now: number): 'hot' | 'warm' 
 
 export function bytes(n: number | undefined): string {
 	if (!n) return '—';
+	if (n < 1 << 20) return `${Math.max(1, Math.round(n / 1024))} KB`;
 	if (n < 1 << 30) return `${Math.round(n / (1 << 20))} MB`;
 	return `${(n / (1 << 30)).toFixed(1)} GB`;
 }
+
+/** "just now" or "5m ago". */
+export const since = (iso: string | undefined, now: number) => {
+	const a = ago(iso, now);
+	return a === 'now' ? 'just now' : a === '—' ? a : `${a} ago`;
+};

@@ -17,6 +17,7 @@ import (
 type Config struct {
 	Projects map[string]ProjectConfig `yaml:"projects"` // keyed by path relative to the root
 	Stacks   map[string]StackConfig   `yaml:"stacks"`
+	GitHub   *bool                    `yaml:"github"` // false: never call gh
 }
 
 type ProjectConfig struct {
@@ -74,6 +75,8 @@ const configTemplate = `# loods config. Read on every scan: save, then press R i
 #     commands:
 #       - blauweschuit/de-website-en-backend:compose
 #       - blauweschuit/de-website-en-backend:dev
+#
+# github: false     # don't ask gh for PRs, issues and CI (on by default when gh is logged in)
 `
 
 // loadConfig reads the config, writing a commented template on first run.

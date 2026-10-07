@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { ClaudeSummary, Plan, Proc, Project, Target } from './lib/api';
+	import { runState, type ClaudeSummary, type GitHubInfo, type Plan, type Proc, type Project, type Target } from './lib/api';
 	import { statusClass, taskProgress } from './lib/plan';
 	import { ago, freshness } from './lib/time';
 
@@ -7,6 +7,7 @@
 		p: Project;
 		plan: Plan | undefined;
 		claude: ClaudeSummary | undefined;
+		gh: GitHubInfo | undefined;
 		procs: Proc[]; // live processes of this project
 		selected: boolean;
 		now: number;
@@ -14,10 +15,12 @@
 		ondetail: () => void;
 		onact: (t: Target | 'run') => void;
 	};
-	let { p, plan, claude, procs, selected, now, onselect, ondetail, onact }: Props = $props();
+	let { p, plan, claude, gh, procs, selected, now, onselect, ondetail, onact }: Props = $props();
 
 	const fresh = $derived(freshness(p.last_activity, now));
 	const progress = $derived(taskProgress(plan));
+	const ci = $derived(gh?.ci ? runState(gh.ci) : null);
+	const serious = $derived(p.warnings?.filter((w) => w.level === 'danger') ?? []);
 	const recentClaude = $derived(claude && (claude.live || now - Date.parse(claude.last_at) < 14 * 86_400_000) ? claude : null);
 </script>
 
@@ -51,6 +54,9 @@
 			<span class="name">{p.branch === 'HEAD' ? 'no commits' : p.branch}</span>
 			{#if p.ahead}<span class="sync up" title="ahead of {p.upstream}">↑{p.ahead}</span>{/if}
 			{#if p.behind}<span class="sync down" title="behind {p.upstream} (last fetch)">↓{p.behind}</span>{/if}
+			{#if ci}
+				<span class="ci {ci}" title="{gh?.ci?.workflow}: {gh?.ci?.status} {gh?.ci?.conclusion}">{ci === 'pass' ? '✓' : ci === 'fail' ? '✗' : '●'}</span>
+			{/if}
 		</div>
 	{/if}
 
@@ -66,6 +72,7 @@
 	{/if}
 
 	<div class="flags">
+		{#each serious as w (w.text)}<span class="flag danger" title={w.text}>⚠ {w.kind === 'env-tracked' ? 'secret committed' : w.text}</span>{/each}
 		{#if p.kind !== 'git'}<span class="flag danger">not in git</span>{/if}
 		{#if p.kind === 'git' && !p.has_remote}<span class="flag danger">no remote</span>{/if}
 		{#if p.dirty_files}<span class="flag warn" title="uncommitted files">✎ {p.dirty_files}</span>{/if}
@@ -73,6 +80,7 @@
 		{#if p.stashes}<span class="flag" title="stashes">⧉ {p.stashes}</span>{/if}
 		{#if (p.branches ?? 0) > 1}<span class="flag" class:info={(p.branches ?? 0) >= 6} title="local branches">⎇ {p.branches}</span>{/if}
 		{#if p.worktrees}<span class="flag info" title="linked worktrees">⌥ {p.worktrees} wt</span>{/if}
+		{#if gh?.prs.length}<span class="flag info" title={gh.prs.map((pr) => `#${pr.number} ${pr.title}`).join('\n')}>⇄ {gh.prs.length} PR{gh.prs.length === 1 ? '' : 's'}</span>{/if}
 		{#if progress[1]}<span class="flag" class:ok={progress[0] === progress[1]} title="tasks done">☑ {progress[0]}/{progress[1]}</span>{/if}
 	</div>
 
@@ -257,6 +265,19 @@
 	.sync.up {
 		color: var(--info);
 		background: var(--info-soft);
+	}
+	.ci {
+		font-size: 12px;
+		font-weight: 700;
+	}
+	.ci.pass {
+		color: var(--hot);
+	}
+	.ci.fail {
+		color: var(--danger);
+	}
+	.ci.pending {
+		color: var(--warm);
 	}
 	.sync.down {
 		color: var(--danger);

@@ -251,3 +251,27 @@ func TestSessionProjectFallsBackToName(t *testing.T) {
 		}
 	}
 }
+
+func TestRealGitHub(t *testing.T) {
+	if os.Getenv("LOODS_REAL") == "" {
+		t.Skip("set LOODS_REAL=1")
+	}
+	home, _ := os.UserHomeDir()
+	items := boardItems(filepath.Join(home, "Projects"), 3, filepath.Join(home, "Archive"))
+	scanAll(items, false)
+	g := newGitHubPoller()
+	start := time.Now()
+	g.refresh(items, githubEvery)
+	info, status := g.snapshot()
+	t.Logf("%v, status %q", time.Since(start), status)
+	for rel, i := range info {
+		ci := "-"
+		if i.CI != nil {
+			ci = i.CI.Workflow + ":" + i.CI.Status + "/" + i.CI.Result
+		}
+		t.Logf("%-40s %-32s prs=%d issues=%d ci=%s err=%s", rel, i.Repo, len(i.PRs), i.Issues, ci, i.Error)
+		for _, p := range i.PRs {
+			t.Logf("    #%d %s [%s] checks=%s review=%s draft=%v", p.Number, p.Branch, p.Title, p.Checks, p.Review, p.Draft)
+		}
+	}
+}

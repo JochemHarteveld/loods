@@ -4,7 +4,14 @@
 	import Detail from './Detail.svelte';
 	import Garage, { type ProcAction } from './Garage.svelte';
 	import Plans, { type Column } from './Plans.svelte';
+	import Hygiene, { type Row } from './Hygiene.svelte';
+	import Graveyard from './Graveyard.svelte';
 	import {
+		bury,
+		fetchBranches,
+		fetchGraveyard,
+		gitOp,
+		unbury,
 		isAlive,
 		openIn,
 		procAction,
@@ -13,7 +20,12 @@
 		startStack,
 		subscribe,
 		updatePlan,
+		type Branch,
+		type BranchList,
 		type ClaudeSummary,
+		type GitHubInfo,
+		type GraveyardData,
+		type OpResult,
 		type Plan,
 		type PlanPatch,
 		type Proc,
@@ -23,17 +35,39 @@
 		type Target
 	} from './lib/api';
 	import { COLUMNS, nextPriority, prioRank, statusLabel } from './lib/plan';
+	import { findings, type Finding } from './lib/hygiene';
 	import { ago, bytes } from './lib/time';
 
 	type Group = { name: string; items: Project[]; latest: number };
-	type View = 'board' | 'plans' | 'garage';
-	const VIEWS: View[] = ['board', 'plans', 'garage'];
+	type View = 'board' | 'plans' | 'garage' | 'hygiene' | 'graveyard';
+	const VIEWS: View[] = ['board', 'plans', 'garage', 'hygiene', 'graveyard'];
+	type ConfirmLine = { text: string; sub?: string; danger?: boolean };
+	type Confirm = {
+		title: string;
+		lines: ConfirmLine[];
+		note?: string;
+		label: string;
+		danger?: boolean;
+		run: () => Promise<OpResult[] | void>;
+	};
 
 	let projects = $state<Project[]>([]);
 	let stacks = $state<Stack[]>([]);
 	let procs = $state<Proc[]>([]);
 	let plans = $state<Record<string, Plan>>({});
 	let claude = $state<Record<string, ClaudeSummary>>({});
+	let github = $state<Record<string, GitHubInfo>>({});
+	let githubStatus = $state('');
+	let hyIndex = $state(0);
+	let grave = $state<GraveyardData | null>(null);
+	let graveLoading = $state(false);
+	let graveSort = $state<'age' | 'size' | 'name'>('age');
+	let graveDupes = $state(false);
+	let graveSel = $state<string | null>(null);
+	let marked = $state(new Set<string>());
+	let confirm = $state<Confirm | null>(null);
+	let confirmBusy = $state(false);
+	let gitVersion = $state(0);
 	let plansPath = $state('');
 	let plansError = $state('');
 	let mem = $state({ total: 0, available: 0 });
@@ -98,16 +132,34 @@
 	const kanban = $derived<Column[]>(
 		COLUMNS.map((status) => ({ status, items: filtered.filter((p) => (plans[p.rel]?.status ?? '') === status).sort(byPriority) }))
 	);
-	// Visual order of the current view, for keeping a valid selection.
-	const order = $derived(view === 'plans' ? kanban.flatMap((c) => c.items) : flat);
 	const selected = $derived(filtered.find((p) => p.rel === selectedId) ?? null);
 	const runningRels = $derived(new Set(procs.filter(isAlive).map((p) => p.project ?? '')));
-	const attention = $derived(projects.filter((p) => p.dirty_files || p.unpushed_commits || !p.has_remote).length);
+	const findingsOf = (p: Project) => findings(p, github[p.rel]);
+	const levelRank = { danger: 0, warn: 1, info: 2 };
+	// Hygiene rows: projects with the worst findings first.
+	const hygieneRows = $derived.by(() => {
+		const per = filtered.map((p) => ({ p, fs: findingsOf(p) })).filter((x) => x.fs.length);
+		per.sort((a, b) => levelRank[a.fs[0].level] - levelRank[b.fs[0].level] || a.p.rel.localeCompare(b.p.rel));
+		return per.flatMap(({ p, fs }) => fs.map((f): Row => ({ p, f })));
+	});
+	const attention = $derived(projects.filter((p) => findingsOf(p).some((f) => f.level !== 'info')).length);
+	const graveItems = $derived.by(() => {
+		const q = query.trim().toLowerCase();
+		let list = (grave?.items ?? []).filter((it) => (!q || it.rel.toLowerCase().includes(q)) && (!graveDupes || it.possible_duplicates?.length));
+		const age = (it: Project) => Date.parse(it.last_activity) || 0;
+		if (graveSort === 'age') list = list.sort((a, b) => age(a) - age(b));
+		else if (graveSort === 'size') list = list.sort((a, b) => (b.size_bytes ?? 0) - (a.size_bytes ?? 0));
+		else list = list.sort((a, b) => a.rel.localeCompare(b.rel));
+		return list;
+	});
+	// Visual order of the current view, for keeping a valid selection.
+	const order = $derived(view === 'plans' ? kanban.flatMap((c) => c.items) : view === 'hygiene' ? hygieneRows.map((r) => r.p) : flat);
 	const live = $derived(procs.filter(isAlive));
 	const liveRSS = $derived(live.reduce((sum, p) => sum + (p.rss_bytes ?? 0), 0));
 	const memUsed = $derived(mem.total ? 1 - mem.available / mem.total : 0);
 	const procsOf = (rel: string) => live.filter((p) => p.project === rel);
 	const selectedProc = $derived(procs.find((p) => p.id === selectedProcId) ?? null);
+	const drawerView = $derived(view === 'board' || view === 'plans' || view === 'hygiene');
 
 	// The view lives in the URL hash, so a reload or bookmark keeps it.
 	$effect(() => {
@@ -121,6 +173,19 @@
 	$effect(() => {
 		if (!selectedProc && procs.length) selectedProcId = procs[0].id;
 	});
+	$effect(() => {
+		if (hyIndex >= hygieneRows.length) hyIndex = Math.max(0, hygieneRows.length - 1);
+	});
+	// The drawer in the Hygiene view shows the project of the selected row.
+	$effect(() => {
+		if (view === 'hygiene' && hygieneRows[hyIndex]) selectedId = hygieneRows[hyIndex].p.rel;
+	});
+	$effect(() => {
+		if (view === 'graveyard' && !grave && !graveLoading) loadGrave(false);
+	});
+	$effect(() => {
+		if (graveItems.length && !graveItems.some((it) => it.rel === graveSel)) graveSel = graveItems[0].rel;
+	});
 
 	onMount(() => {
 		const stop = subscribe(
@@ -129,6 +194,8 @@
 				stacks = s.stacks;
 				plans = s.plans ?? {};
 				claude = s.claude ?? {};
+				github = s.github ?? {};
+				githubStatus = s.github_status ?? '';
 				plansPath = s.plans_path;
 				plansError = s.plans_error ?? '';
 				root = s.root;
@@ -164,6 +231,156 @@
 		} catch (e) {
 			flash((e as Error).message, true);
 		}
+	}
+
+	// --- confirmations, hygiene fixes, graveyard ---
+
+	function summarize(results: OpResult[] | void, verb: string) {
+		if (!results) return flash(verb);
+		const ok = results.filter((r) => r.ok);
+		const bad = results.filter((r) => !r.ok);
+		if (!bad.length) return flash(`${verb}: ${ok.length}`);
+		flash(`${verb}: ${ok.length}. Not done: ${bad.map((r) => `${r.name} (${r.error})`).join('; ')}`, true);
+	}
+
+	async function runConfirm() {
+		if (!confirm || confirmBusy) return;
+		const c = confirm;
+		confirmBusy = true;
+		try {
+			summarize(await c.run(), c.label);
+			confirm = null;
+		} catch (e) {
+			flash((e as Error).message, true);
+		} finally {
+			confirmBusy = false;
+		}
+	}
+
+	function deleteBranches(p: Project, branches: Branch[], data: BranchList) {
+		if (!branches.length) return flash('No branches to delete');
+		const prs = github[p.rel]?.prs ?? [];
+		confirm = {
+			title: `Delete ${branches.length} branch${branches.length === 1 ? '' : 'es'} in ${p.name}`,
+			lines: branches.map((b) => {
+				const pr = prs.find((x) => x.branch === b.name);
+				const sub = [
+					b.merged ? `merged into ${data.default}` : `${b.base_ahead} commit${b.base_ahead === 1 ? '' : 's'} not in ${data.default}`,
+					b.upstream_gone ? 'remote branch deleted' : !b.upstream ? 'never pushed' : '',
+					b.worktree ? `its worktree goes too (if clean): ${b.worktree}` : '',
+					pr ? `open PR #${pr.number} (stays on GitHub)` : ''
+				];
+				return { text: b.name, sub: sub.filter(Boolean).join(' · '), danger: !b.merged };
+			}),
+			note: 'Undoable: loods logs the commit of every branch it deletes. Worktrees with uncommitted changes are kept.',
+			label: 'Deleted',
+			danger: branches.some((b) => !b.merged),
+			run: async () => {
+				const r = await gitOp('delete-branches', p.rel, branches.map((b) => b.name));
+				gitVersion++;
+				return r;
+			}
+		};
+	}
+
+	async function undoGit(p: Project) {
+		try {
+			summarize(await gitOp('undo', p.rel), 'Restored');
+			gitVersion++;
+		} catch (e) {
+			flash((e as Error).message, true);
+		}
+	}
+
+	async function fixFinding(p: Project, f: Finding) {
+		switch (f.fix) {
+			case 'cleanup-branches': {
+				const data = await fetchBranches(p.rel).catch((e) => (flash(e.message, true), null));
+				if (!data) return;
+				const def = data.default.replace(/^origin\//, '');
+				const ok = (b: Branch) => !b.current && b.name !== def;
+				const list = data.branches.filter((b) => ok(b) && (f.kind === 'gone-branches' ? b.upstream_gone && !b.merged : b.merged));
+				return deleteBranches(p, list, data);
+			}
+			case 'prune-worktrees':
+				confirm = {
+					title: `Prune worktrees in ${p.name}`,
+					lines: [{ text: f.text }],
+					note: 'Runs git worktree prune: it only forgets worktrees whose folder no longer exists.',
+					label: 'Pruned',
+					run: async () => {
+						const r = await gitOp('prune-worktrees', p.rel);
+						gitVersion++;
+						return r;
+					}
+				};
+				return;
+			case 'ignore-env':
+				confirm = {
+					title: `Ignore secret files in ${p.name}`,
+					lines: [{ text: f.text }],
+					note: 'Appends their exact paths to .gitignore. Commit that change yourself.',
+					label: 'Ignored',
+					run: () => gitOp('ignore-env', p.rel)
+				};
+				return;
+		}
+		if (f.url) window.open(f.url, '_blank', 'noopener');
+	}
+
+	async function loadGrave(fresh: boolean) {
+		graveLoading = true;
+		try {
+			grave = await fetchGraveyard(fresh);
+		} catch (e) {
+			flash((e as Error).message, true);
+		} finally {
+			graveLoading = false;
+		}
+	}
+
+	function toggleMark(rel: string) {
+		const next = new Set(marked);
+		if (!next.delete(rel)) next.add(rel);
+		marked = next;
+	}
+
+	function buryMarked(action: 'archive' | 'trash') {
+		const rels = marked.size ? [...marked] : graveSel ? [graveSel] : [];
+		const items = rels.map((r) => grave?.items.find((it) => it.rel === r)).filter((it): it is Project => !!it);
+		if (!items.length) return;
+		const trash = action === 'trash';
+		confirm = {
+			title: `${trash ? 'Move to the trash' : 'Archive'}: ${items.length} item${items.length === 1 ? '' : 's'}`,
+			lines: items.map((it) => ({ text: it.rel, sub: [bytes(it.size_bytes), ...(it.risks ?? [])].join(' · '), danger: !!it.risks?.some((r) => r !== 'not in git') })),
+			note: trash
+				? 'Uses the system trash: restore from your file manager. loods cannot undo this.'
+				: `Moves them to ${grave?.archive}/<date>/… (same disk, nothing copied). u undoes the last archive.`,
+			label: trash ? 'Trashed' : 'Archived',
+			danger: trash,
+			run: async () => {
+				const r = await bury(action, items.map((it) => it.rel));
+				marked = new Set();
+				await loadGrave(false);
+				return r;
+			}
+		};
+	}
+
+	function undoBury() {
+		const batch = grave?.batches.find((b) => b.action === 'archive' && !b.restored);
+		if (!batch) return flash('Nothing to undo (trashed items: restore them from the trash)');
+		confirm = {
+			title: `Undo the archive of ${ago(batch.time, now) === 'now' ? 'just now' : ago(batch.time, now) + ' ago'}: ${batch.items.length} item${batch.items.length === 1 ? '' : 's'}`,
+			lines: batch.items.map((path) => ({ text: path })),
+			note: 'Moves them back to where they were. Anything that exists there again is skipped.',
+			label: 'Restored',
+			run: async () => {
+				const r = await unbury();
+				await loadGrave(false);
+				return r;
+			}
+		};
 	}
 
 	const labels: Record<Target, string> = { code: 'VS Code', terminal: 'Terminal', folder: 'Folder', github: 'Remote' };
@@ -325,6 +542,20 @@
 		if (j >= 0 && j < COLUMNS.length) setStatus(selected, COLUMNS[j]);
 	}
 
+	function moveHygiene(delta: number) {
+		if (!hygieneRows.length) return;
+		hyIndex = Math.min(hygieneRows.length - 1, Math.max(0, hyIndex + delta));
+		tick().then(() => document.querySelector(`[data-row="${hyIndex}"]`)?.scrollIntoView({ block: 'nearest' }));
+	}
+
+	function moveGrave(delta: number) {
+		const i = graveItems.findIndex((it) => it.rel === graveSel);
+		const next = graveItems[Math.min(graveItems.length - 1, Math.max(0, i + delta))];
+		if (!next) return;
+		graveSel = next.rel;
+		tick().then(() => cardEl(next.rel)?.scrollIntoView({ block: 'nearest' }));
+	}
+
 	function moveProc(delta: number) {
 		if (!procs.length) return;
 		const i = procs.findIndex((p) => p.id === selectedProcId);
@@ -337,6 +568,61 @@
 			filterEl?.focus();
 			filterEl?.select();
 		});
+	}
+
+	function confirmKey(e: KeyboardEvent) {
+		if (e.key === 'Escape' || e.key === 'n') confirm = null;
+		else if (e.key === 'Enter' || e.key === 'y') runConfirm();
+		else return;
+		e.preventDefault();
+	}
+
+	function hygieneKey(e: KeyboardEvent) {
+		const row = hygieneRows[hyIndex];
+		switch (e.key) {
+			case 'ArrowDown':
+			case 'j':
+				return moveHygiene(1);
+			case 'ArrowUp':
+			case 'k':
+				return moveHygiene(-1);
+			case 'Enter':
+				if (!row) return;
+				if (row.f.fix || row.f.url) return fixFinding(row.p, row.f);
+				detailOpen = !detailOpen;
+				return;
+		}
+		return projectKey(e);
+	}
+
+	function graveKey(e: KeyboardEvent) {
+		switch (e.key) {
+			case 'ArrowDown':
+			case 'j':
+				return moveGrave(1);
+			case 'ArrowUp':
+			case 'k':
+				return moveGrave(-1);
+			case ' ':
+				if (graveSel) toggleMark(graveSel);
+				return moveGrave(1);
+			case 'a':
+				return buryMarked('archive');
+			case 'x':
+				return buryMarked('trash');
+			case 'u':
+				return undoBury();
+			case 'd':
+				graveDupes = !graveDupes;
+				return;
+			case 's':
+				graveSort = graveSort === 'age' ? 'size' : graveSort === 'size' ? 'name' : 'age';
+				return;
+			case 'Escape':
+				marked = new Set();
+				return;
+		}
+		return false;
 	}
 
 	function statusKey(e: KeyboardEvent) {
@@ -494,6 +780,7 @@
 			return focusFilter();
 		}
 		if (e.ctrlKey || e.metaKey || e.altKey) return;
+		if (confirm) return confirmKey(e);
 		if (picker) return pickerKey(e);
 		if (statusPicker) return statusKey(e);
 		if (e.target === filterEl) {
@@ -516,6 +803,8 @@
 			case '1':
 			case '2':
 			case '3':
+			case '4':
+			case '5':
 				view = VIEWS[+e.key - 1];
 				break;
 			case '/':
@@ -523,18 +812,22 @@
 				break;
 			case 'R':
 				attempt(rescan, 'Rescanning…');
+				if (view === 'graveyard') loadGrave(true);
 				break;
 			case '?':
 				helpOpen = !helpOpen;
 				break;
 			default:
-				if ((view === 'board' ? boardKey(e) : view === 'plans' ? plansKey(e) : garageKey(e)) === false) return;
+				{
+					const handle = { board: boardKey, plans: plansKey, garage: garageKey, hygiene: hygieneKey, graveyard: graveKey }[view];
+					if (handle(e) === false) return;
+				}
 		}
 		e.preventDefault();
 	}
 
 	const keys: [string, string, string][] = [
-		['1 / 2 / 3', 'Board / Plans / Garage', 'any'],
+		['1 – 5', 'Board · Plans · Garage · Hygiene · Graveyard', 'any'],
 		['/  ctrl+k', 'filter projects (also matches status and next step)', 'any'],
 		['R', 'rescan now', 'any'],
 		['←↓↑→ / hjkl', 'move', 'board, plans'],
@@ -554,13 +847,19 @@
 		['r · x', 'restart · stop (twice: kill)', 'garage'],
 		['u · U', 'flutter hot reload · hot restart', 'garage'],
 		['w', 'open URL', 'garage'],
-		['del', 'remove an exited process', 'garage']
+		['del', 'remove an exited process', 'garage'],
+		['j / k · enter', 'select · fix (asks first) or details', 'hygiene'],
+		['space', 'mark', 'graveyard'],
+		['a · x', 'archive · trash the marked (or selected) items', 'graveyard'],
+		['u', 'undo the last archive', 'graveyard'],
+		['d · s', 'duplicates only · sort by age / size / name', 'graveyard'],
+		['y / n', 'confirm / cancel a question', 'any']
 	];
 </script>
 
 <svelte:window {onkeydown} />
 
-<div class="app" class:with-detail={view !== 'garage' && detailOpen && selected}>
+<div class="app" class:with-detail={drawerView && detailOpen && selected}>
 	<header class="top">
 		<div class="brand">
 			<img src="/icon.svg" alt="" width="22" height="22" />
@@ -574,7 +873,12 @@
 				{#if live.length}<span class="count">{live.length}</span>{/if}
 				<kbd>3</kbd>
 			</button>
-			<span class="tab soon" title="phase 4">Graveyard</span>
+			<button class="tab" class:active={view === 'hygiene'} onclick={() => (view = 'hygiene')}>
+				Hygiene
+				{#if attention}<span class="count warn">{attention}</span>{/if}
+				<kbd>4</kbd>
+			</button>
+			<button class="tab" class:active={view === 'graveyard'} onclick={() => (view = 'graveyard')}>Graveyard <kbd>5</kbd></button>
 		</nav>
 		{#if view !== 'garage'}
 			<input
@@ -593,7 +897,7 @@
 					{#if liveRSS}<span class="muted">· {bytes(liveRSS)} here</span>{/if}
 				</span>
 			{/if}
-			{#if attention}<span class="attn" title="uncommitted, unpushed or no remote">{attention} need attention</span>{/if}
+			{#if attention}<button class="attn" title="open Hygiene (4)" onclick={() => (view = 'hygiene')}>{attention} need attention</button>{/if}
 			<span class="scan" class:busy={scanning} title={root}>
 				<span class="conn" class:up={connected}></span>
 				{scanning ? 'scanning…' : scannedAt ? (ago(scannedAt, now) === 'now' ? 'scanned just now' : `scanned ${ago(scannedAt, now)} ago`) : 'connecting…'}
@@ -633,6 +937,7 @@
 									{p}
 									plan={plans[p.rel]}
 									claude={claude[p.rel]}
+									gh={github[p.rel]}
 									{now}
 									procs={procsOf(p.rel)}
 									selected={p.rel === selectedId}
@@ -645,6 +950,36 @@
 					</section>
 				{/each}
 			</div>
+		</main>
+	{:else if view === 'hygiene'}
+		<main>
+			<Hygiene
+				rows={hygieneRows}
+				selected={hyIndex}
+				{githubStatus}
+				onselect={(i) => (hyIndex = i)}
+				onfix={(r) => fixFinding(r.p, r.f)}
+				ondetail={(r) => ((hyIndex = hygieneRows.indexOf(r)), (detailOpen = true))}
+			/>
+		</main>
+	{:else if view === 'graveyard'}
+		<main>
+			<Graveyard
+				items={graveItems}
+				{plans}
+				batches={grave?.batches ?? []}
+				{marked}
+				selectedId={graveSel}
+				loading={graveLoading}
+				scannedAt={grave?.scanned_at ?? ''}
+				archive={grave?.archive ?? ''}
+				sortBy={graveSort}
+				dupesOnly={graveDupes}
+				{now}
+				onselect={(rel) => (graveSel = rel)}
+				ontoggle={toggleMark}
+				onundo={undoBury}
+			/>
 		</main>
 	{:else if view === 'plans'}
 		<main class="plans-main">
@@ -689,6 +1024,21 @@
 			<span><kbd>/</kbd> filter</span>
 			<span><kbd>n</kbd> next step</span>
 			<span><kbd>s</kbd> sort: {sortBy}</span>
+		{:else if view === 'hygiene'}
+			<span><kbd>j</kbd><kbd>k</kbd> select</span>
+			<span><kbd>enter</kbd> fix / details</span>
+			<span><kbd>space</kbd> details</span>
+			<span><kbd>c</kbd> code</span>
+			<span><kbd>t</kbd> terminal</span>
+		{:else if view === 'graveyard'}
+			<span><kbd>j</kbd><kbd>k</kbd> select</span>
+			<span><kbd>space</kbd> mark</span>
+			<span><kbd>a</kbd> archive</span>
+			<span><kbd>x</kbd> trash</span>
+			<span><kbd>u</kbd> undo</span>
+			<span><kbd>d</kbd> dupes{graveDupes ? ' ✓' : ''}</span>
+			<span><kbd>s</kbd> sort: {graveSort}</span>
+			<span><kbd>R</kbd> re-measure</span>
 		{:else if view === 'plans'}
 			<span><kbd>hjkl</kbd> move</span>
 			<span><kbd>H</kbd><kbd>L</kbd> move card</span>
@@ -711,12 +1061,18 @@
 	</footer>
 </div>
 
-{#if view !== 'garage' && detailOpen && selected}
+{#if drawerView && detailOpen && selected}
 	<Detail
 		bind:this={detail}
 		p={selected}
 		plan={plans[selected.rel]}
 		claude={claude[selected.rel]}
+		gh={github[selected.rel]}
+		findings={findingsOf(selected)}
+		version={gitVersion}
+		onfix={(f) => fixFinding(selected, f)}
+		ondelete={(branches, data) => deleteBranches(selected, branches, data)}
+		onundo={() => undoGit(selected)}
 		{now}
 		onclose={() => (detailOpen = false)}
 		onact={(t) => act(selected, t)}
@@ -767,6 +1123,28 @@
 				{/each}
 			</ul>
 			<p class="foot">Set the default or add commands in <code>{configPath}</code></p>
+		</div>
+	</div>
+{/if}
+
+{#if confirm}
+	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+	<div class="overlay" onclick={() => !confirmBusy && (confirm = null)}>
+		<div class="modal confirm" class:danger={confirm.danger} onclick={(e) => e.stopPropagation()}>
+			<h2>{confirm.title}</h2>
+			<ul>
+				{#each confirm.lines as l (l.text)}
+					<li class:danger={l.danger}>
+						<span class="ltext">{l.text}</span>
+						{#if l.sub}<span class="lsub">{l.sub}</span>{/if}
+					</li>
+				{/each}
+			</ul>
+			{#if confirm.note}<p class="foot">{confirm.note}</p>{/if}
+			<div class="actions">
+				<button onclick={() => (confirm = null)} disabled={confirmBusy}><kbd>n</kbd> cancel</button>
+				<button class="go" onclick={runConfirm} disabled={confirmBusy}><kbd>y</kbd> {confirmBusy ? 'working…' : 'yes, do it'}</button>
+			</div>
 		</div>
 	</div>
 {/if}
@@ -847,9 +1225,8 @@
 		color: var(--text);
 		box-shadow: var(--shadow);
 	}
-	.tab.soon {
-		opacity: 0.45;
-		cursor: default;
+	.count.warn {
+		background: var(--accent);
 	}
 	.count {
 		font-size: 11px;
@@ -908,7 +1285,75 @@
 		color: var(--faint);
 	}
 	.attn {
+		border: none;
+		background: none;
+		padding: 0;
+		font: inherit;
 		color: var(--accent);
+		cursor: pointer;
+	}
+	.attn:hover {
+		text-decoration: underline;
+	}
+	.confirm {
+		width: min(560px, 100%);
+	}
+	.confirm.danger h2 {
+		color: var(--danger);
+	}
+	.confirm ul {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		max-height: 50vh;
+		overflow-y: auto;
+	}
+	.confirm li {
+		display: flex;
+		flex-direction: column;
+		padding: 6px 10px;
+		border-radius: 6px;
+		background: var(--card);
+	}
+	.ltext {
+		font: 13px var(--mono);
+		overflow-wrap: anywhere;
+	}
+	.confirm li.danger .ltext {
+		color: var(--danger);
+	}
+	.lsub {
+		font-size: 12px;
+		color: var(--muted);
+	}
+	.actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 8px;
+		margin-top: 16px;
+	}
+	.actions button {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		padding: 6px 14px;
+		border: 1px solid var(--line);
+		border-radius: 7px;
+		background: var(--card);
+		cursor: pointer;
+		font-size: 13px;
+	}
+	.actions .go {
+		border-color: var(--accent);
+		color: var(--accent);
+		font-weight: 600;
+	}
+	.confirm.danger .go {
+		border-color: var(--danger);
+		color: var(--danger);
 	}
 	.scan {
 		display: flex;

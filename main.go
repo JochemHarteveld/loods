@@ -99,6 +99,7 @@ flags:
 		fail(err)
 	}
 	go s.indexClaude()
+	go s.githubLoop()
 	go s.loop(30 * time.Second)
 	go s.statsLoop(2 * time.Second)
 	fmt.Printf("loods: %s  (root %s, config %s)\n", url, root, s.cfgPath)

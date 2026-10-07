@@ -1,7 +1,19 @@
 <script lang="ts">
 	import PlanEditor from './PlanEditor.svelte';
-	import { fetchBranches, type BranchList, type ClaudeSummary, type Plan, type PlanPatch, type Project, type Target } from './lib/api';
-	import { ago } from './lib/time';
+	import {
+		fetchBranches,
+		runState,
+		type Branch,
+		type BranchList,
+		type ClaudeSummary,
+		type GitHubInfo,
+		type Plan,
+		type PlanPatch,
+		type Project,
+		type Target
+	} from './lib/api';
+	import { fixLabel, hints, type Finding } from './lib/hygiene';
+	import { ago, since } from './lib/time';
 
 	type Props = {
 		p: Project;
@@ -11,8 +23,14 @@
 		onclose: () => void;
 		onact: (t: Target) => void;
 		onsave: (patch: PlanPatch) => Promise<unknown>;
+		gh: GitHubInfo | undefined;
+		findings: Finding[];
+		version: number; // bumped after git cleanups: refetch branches
+		onfix: (f: Finding) => void;
+		ondelete: (branches: Branch[], data: BranchList) => void;
+		onundo: () => void;
 	};
-	let { p, plan, claude, now, onclose, onact, onsave }: Props = $props();
+	let { p, plan, claude, now, onclose, onact, onsave, gh, findings, version, onfix, ondelete, onundo }: Props = $props();
 
 	let editor = $state<ReturnType<typeof PlanEditor>>();
 	export const focusNext = () => editor?.focusNext();
@@ -28,6 +46,7 @@
 	$effect(() => {
 		const current = id;
 		void activity;
+		void version;
 		if (p.kind !== 'git') {
 			data = null;
 			return;
@@ -41,6 +60,11 @@
 	});
 
 	const defaultName = $derived(data?.default.replace(/^origin\//, '') ?? '');
+	const deletable = (b: Branch) => !b.current && b.name !== defaultName;
+	const mergedOnes = $derived(data?.branches.filter((b) => deletable(b) && b.merged) ?? []);
+	const goneOnes = $derived(data?.branches.filter((b) => deletable(b) && !b.merged && b.upstream_gone) ?? []);
+	const prFor = (branch: string) => gh?.prs.find((pr) => pr.branch === branch);
+	const ciState = $derived(gh?.ci ? runState(gh.ci) : null);
 </script>
 
 <aside>
@@ -64,9 +88,21 @@
 			{ago(p.last_activity, now) === 'now' ? 'just now' : `${ago(p.last_activity, now)} ago`}
 			{#if p.last_commit}<span class="muted">· last commit {ago(p.last_commit, now)} ago</span>{/if}
 		</dd>
-		{#if p.risks?.length}
-			<dt>attention</dt>
-			<dd class="risks">{p.risks.join(' · ')}</dd>
+		{#if gh}
+			<dt>github</dt>
+			<dd>
+				{#if gh.error}<span class="muted">{gh.error}</span>
+				{:else}
+					{#if gh.ci}
+						<a class="ci {ciState}" href={gh.ci.url} target="_blank" rel="noreferrer">
+							{ciState === 'pass' ? '✓' : ciState === 'fail' ? '✗' : '●'} {gh.ci.workflow}
+						</a>
+						<span class="muted">on {gh.ci.branch} · {since(gh.ci.created_at, now)} ·</span>
+					{/if}
+					<a href="https://github.com/{gh.repo}/pulls" target="_blank" rel="noreferrer">{gh.prs.length} open PR{gh.prs.length === 1 ? '' : 's'}</a>
+					· <a href="https://github.com/{gh.repo}/issues" target="_blank" rel="noreferrer">{gh.issues} issue{gh.issues === 1 ? '' : 's'}</a>
+				{/if}
+			</dd>
 		{/if}
 	</dl>
 
@@ -77,13 +113,65 @@
 		{#if p.web_url}<button onclick={() => onact('github')}><kbd>g</kbd> Remote</button>{/if}
 	</div>
 
+	{#if findings.length}
+		<ul class="findings">
+			{#each findings as f (f.kind + f.text)}
+				<li class={f.level}>
+					<span class="fdot"></span>
+					<span class="ftext">{f.text}</span>
+					{#if f.fix}<button onclick={() => onfix(f)}>{fixLabel[f.fix]}</button>
+					{:else if f.url}<a href={f.url} target="_blank" rel="noreferrer">open ↗</a>
+					{:else if hints[f.kind]}<span class="fhint">{hints[f.kind]}</span>{/if}
+				</li>
+			{/each}
+		</ul>
+	{/if}
+
 	<PlanEditor bind:this={editor} rel={p.rel} {plan} {claude} {now} {onsave} />
+
+	{#if gh?.prs.length}
+		<h3>Pull requests <span class="muted">{gh.prs.length} open</span></h3>
+		<ul class="prs">
+			{#each gh.prs as pr (pr.number)}
+				<li>
+					<a href={pr.url} target="_blank" rel="noreferrer">
+						<span class="num">#{pr.number}</span>
+						<span class="ptitle">{pr.title}</span>
+					</a>
+					<span class="pmeta">
+						{#if pr.draft}<span class="tag">draft</span>{/if}
+						{#if pr.checks}<span class="tag {pr.checks === 'pass' ? 'ok' : pr.checks === 'fail' ? 'danger' : 'warn'}">checks {pr.checks}</span>{/if}
+						{#if pr.review === 'APPROVED'}<span class="tag ok">approved</span>
+						{:else if pr.review === 'CHANGES_REQUESTED'}<span class="tag danger">changes requested</span>{/if}
+						<span class="mono">⎇ {pr.branch}</span>
+					</span>
+				</li>
+			{/each}
+		</ul>
+	{/if}
 
 	{#if p.kind === 'git'}
 		<h3>
 			Branches
 			{#if data}<span class="muted">{data.branches.length} · compared to {data.default || '—'}</span>{/if}
 		</h3>
+		{#if data && (mergedOnes.length || goneOnes.length || data.undo)}
+			<div class="cleanup">
+				{#if mergedOnes.length}
+					<button onclick={() => data && ondelete(mergedOnes, data)}>Delete {mergedOnes.length} merged</button>
+				{/if}
+				{#if goneOnes.length}
+					<button onclick={() => data && ondelete(goneOnes, data)} title="Their remote branch was deleted, usually after a squash-merged PR"
+						>Delete {goneOnes.length} with deleted remote</button
+					>
+				{/if}
+				{#if data.undo}
+					<button class="undo" onclick={onundo}>
+						Undo cleanup ({data.undo.branches.length} branch{data.undo.branches.length === 1 ? '' : 'es'}, {since(data.undo.time, now)})
+					</button>
+				{/if}
+			</div>
+		{/if}
 		{#if error}
 			<p class="err">{error}</p>
 		{:else if !data}
@@ -94,7 +182,14 @@
 					<li class:current={b.current} class:merged={b.merged && b.name !== defaultName}>
 						<div class="row1">
 							<span class="bname">{b.current ? '● ' : ''}{b.name}</span>
+							{#if prFor(b.name)}
+								{@const pr = prFor(b.name)}
+								<a class="prtag" href={pr?.url} target="_blank" rel="noreferrer" title={pr?.title}>#{pr?.number}</a>
+							{/if}
 							<span class="when">{ago(b.last_commit, now)}</span>
+							{#if data && deletable(b)}
+								<button class="del" title="Delete branch (undoable)" onclick={() => data && ondelete([b], data)}>✕</button>
+							{/if}
 						</div>
 						<div class="row2">
 							{#if b.name === defaultName}<span class="tag">default</span>
@@ -171,8 +266,151 @@
 	a {
 		color: var(--info);
 	}
-	.risks {
-		color: var(--accent);
+	.ci {
+		text-decoration: none;
+		font-weight: 600;
+	}
+	.ci.pass {
+		color: var(--hot);
+	}
+	.ci.fail {
+		color: var(--danger);
+	}
+	.ci.pending {
+		color: var(--warm);
+	}
+	.findings {
+		list-style: none;
+		margin: 16px 0 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.findings li {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 12.5px;
+		padding: 6px 10px;
+		border-radius: 7px;
+		background: var(--card);
+	}
+	.fdot {
+		flex: none;
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--info);
+	}
+	.warn .fdot {
+		background: var(--accent);
+	}
+	.danger .fdot {
+		background: var(--danger);
+	}
+	.danger .ftext {
+		color: var(--danger);
+	}
+	.ftext {
+		flex: 1;
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+	.findings button,
+	.cleanup button {
+		flex: none;
+		font-size: 12px;
+		padding: 2px 9px;
+		border: 1px solid var(--line);
+		border-radius: 6px;
+		background: var(--panel);
+		cursor: pointer;
+	}
+	.findings button:hover,
+	.cleanup button:hover {
+		border-color: var(--accent);
+	}
+	.fhint {
+		flex: none;
+		max-width: 50%;
+		color: var(--faint);
+		font-size: 11.5px;
+		text-align: right;
+	}
+	.cleanup {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		margin-bottom: 8px;
+	}
+	.cleanup .undo {
+		color: var(--info);
+	}
+	.prs {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.prs li {
+		padding: 7px 10px;
+		border-radius: 6px;
+		background: var(--card);
+	}
+	.prs a {
+		display: flex;
+		gap: 6px;
+		text-decoration: none;
+		color: var(--text);
+		font-size: 13px;
+	}
+	.prs a:hover .ptitle {
+		color: var(--info);
+	}
+	.num {
+		color: var(--faint);
+		font-family: var(--mono);
+		font-size: 12px;
+	}
+	.ptitle {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		min-width: 0;
+	}
+	.pmeta {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+		margin-top: 4px;
+		font-size: 11.5px;
+		color: var(--muted);
+		align-items: center;
+	}
+	.prtag {
+		flex: none;
+		font-size: 11px;
+		color: var(--info);
+		text-decoration: none;
+	}
+	.del {
+		flex: none;
+		border: none;
+		background: none;
+		color: var(--faint);
+		cursor: pointer;
+		font-size: 11px;
+		padding: 0 2px;
+		opacity: 0;
+	}
+	.branches li:hover .del {
+		opacity: 1;
+	}
+	.del:hover {
+		color: var(--danger);
 	}
 	.muted {
 		color: var(--muted);
@@ -235,6 +473,8 @@
 		font: 12.5px var(--mono);
 	}
 	.bname {
+		flex: 1;
+		min-width: 0;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;

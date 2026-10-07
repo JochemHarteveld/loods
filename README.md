@@ -2,7 +2,7 @@
 
 One board for every project under `~/Projects`: activity, git state, branches,
 shortcuts to open them, a plan per project (status, next step, tasks) with a kanban,
-and a Garage that runs their dev servers. Runs as a local
+a Garage that runs their dev servers, and Hygiene / Graveyard views to clean up. Runs as a local
 server with the UI in a chromeless app window.
 Absorbs [graveyard](../graveyard) (archive / trash / undo).
 
@@ -20,7 +20,8 @@ loods claude install  # /wrapup skill + SessionStart hook for Claude Code
 
 ## Keys
 
-Everywhere: `1` Board · `2` Plans · `3` Garage · `/` or `ctrl+k` filter · `R` rescan · `?` help
+Everywhere: `1` Board · `2` Plans · `3` Garage · `4` Hygiene · `5` Graveyard · `/` or `ctrl+k` filter ·
+`R` rescan · `?` help · `y`/`n` answer a confirmation
 
 Board: `hjkl`/arrows move · `enter` details, plan & branches · `c` VS Code · `t` terminal ·
 `o` folder · `g` remote · `r` run · `x` stop · `L` logs · `w` open web URL ·
@@ -29,6 +30,11 @@ Board: `hjkl`/arrows move · `enter` details, plan & branches · `c` VS Code · 
 Board and Plans: `n` next step · `a` add task · `N` notes · `m` status · `p` priority
 
 Plans: `hjkl` move · `H`/`L` move the card a column left / right (or drag it)
+
+Hygiene: `j`/`k` select · `enter` fix (asks first) · `space` details
+
+Graveyard: `space` mark · `a` archive · `x` trash · `u` undo the last archive · `d` duplicates only ·
+`s` sort by age / size / name · `R` measure again
 
 Garage: `j`/`k` select · `i`/`enter` type into the terminal (`esc` leaves) · `r` restart ·
 `x` stop (again: kill) · `u`/`U` flutter hot reload / restart · `w` open URL · `del` remove
@@ -78,6 +84,40 @@ loods plan -p group/project …    # another project
     context, so Claude knows where you left off.
 
   `settings.json` keeps its other keys and order; a backup is written next to it.
+
+## Hygiene
+
+Findings per project, worst first. Fixes always show what they will do and ask first.
+
+| Finding | Fix |
+|---|---|
+| `.env` (or `.env.production`, …) committed | hint: `git rm --cached`, ignore it, rotate the secrets |
+| `.env` on disk and not ignored | append its exact path to `.gitignore` |
+| uncommitted changes older than 7 days, commits unpushed for 3+ days, no remote, behind upstream | hints |
+| branches merged into the default branch, or whose remote branch was deleted | delete them (clean worktrees go too) |
+| worktrees whose folder is gone | `git worktree prune` |
+| failing CI on the checked-out branch, PRs with failing checks | link |
+
+Branch cleanup is undoable: every deleted branch is logged with its commit in
+`~/.local/state/loods/git-cleanup.log`, and "Undo cleanup" in the details drawer recreates the
+branches and their worktrees. Nothing is forced: worktrees with uncommitted changes are kept.
+Single branches can be deleted from the drawer too (✕ on hover).
+
+### GitHub
+
+With `gh` installed and logged in, loods asks GitHub every 5 minutes (and on `R`) for open PRs
+with their checks and reviews, the open issue count and the latest CI run on the checked-out
+branch. Cards show CI (✓ ✗ ●) and PR count; the drawer lists the PRs and tags branches that
+have one. Read-only; turn it off with `github: false` in `config.yaml`.
+
+## Graveyard
+
+Everything under the root, including plain folders and archive files, with real sizes
+(`node_modules` included, so measuring takes a few seconds; cached for 2 minutes). Flags show
+possible duplicates, uncommitted or unpushed work and plan status (`dead` projects are struck
+through). Archive moves into `~/Archive/<date>/<path>` (same disk only, never copies) and is
+undoable; trash uses `gio trash`. Both share `~/Archive/graveyard.log` with `loods undo` and the
+old graveyard tool. Projects with a running process are refused.
 
 ## Garage
 
@@ -134,7 +174,8 @@ stacks:
 - Rescans every 30 s (or `R`) and pushes a snapshot over SSE; the UI only re-renders when something changed.
   Plan edits and new Claude transcript lines are picked up between scans.
 - Board scans skip `node_modules`, `build`, … entirely, so a full scan takes about a second.
-- Ahead/behind counts come from the last `git fetch`; loods never touches the network.
+- Ahead/behind counts come from the last `git fetch`; loods never fetches. The only network use is
+  the read-only `gh` queries above.
 - Branch details compare every local branch with the remote's default branch (`origin/HEAD`).
 - The server binds to 127.0.0.1, rejects requests for any other `Host` (DNS rebinding), and
   requires an `X-Loods` header on POSTs, so other websites cannot make it launch things.
@@ -154,5 +195,5 @@ make test
 1. ~~Board: cards, git state, branches, open in VS Code / terminal, live refresh~~
 2. ~~Garage: detected dev commands, process manager with terminals, ports, RAM, stacks~~
 3. ~~Plans: status / next step / priority / tasks, kanban, Claude sessions, /wrapup + SessionStart hook~~
-4. Hygiene: branch & worktree cleanup, `gh` PRs and CI, warnings, graveyard view
+4. ~~Hygiene: branch & worktree cleanup with undo, `gh` PRs and CI, warnings, graveyard view~~
 5. Extras: activity feed, ask-Claude, weekly digest, adb / serial devices

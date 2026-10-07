@@ -33,16 +33,21 @@ type Server struct {
 	procs  *Manager
 	plans  *PlanStore
 	claude *claudeIndex
+	gh     *githubPoller
+	gitlog *gitLog
+	grave  graveCache
 
 	mu        sync.RWMutex
 	items     []*Item
 	stacks    []Stack
 	cfgErr    string
+	githubOff bool
 	snapshot  []byte // JSON sent to clients, cached between scans
 	procsJSON []byte
 	subs      map[*sub]struct{}
 
 	trigger chan struct{}
+	ghKick  chan struct{}
 }
 
 // sub is one connected window; each flag is set when that kind of data changed.
@@ -61,6 +66,9 @@ type Snapshot struct {
 	PlansPath  string                   `json:"plans_path"`
 	PlansError string                   `json:"plans_error,omitempty"`
 	Claude     map[string]ClaudeSummary `json:"claude"`
+	// GitHub is keyed by project rel; GitHubStatus says why it is empty.
+	GitHub       map[string]GitHubInfo `json:"github"`
+	GitHubStatus string                `json:"github_status,omitempty"`
 }
 
 type ProcsEvent struct {
@@ -77,9 +85,12 @@ func newServer(root, archive string, depth, port int, stateFile string) *Server 
 		claude:  newClaudeIndex(claudeProjectsDir()),
 		subs:    map[*sub]struct{}{},
 		trigger: make(chan struct{}, 1),
+		ghKick:  make(chan struct{}, 1),
+		gh:      newGitHubPoller(),
 	}
 	s.plans.Refresh()
 	s.procs = newManager(stateFile, s.publishProcs)
+	s.gitlog = &gitLog{path: gitLogPath(filepath.Dir(stateFile))}
 	return s
 }
 
@@ -109,6 +120,25 @@ func (s *Server) statsLoop(every time.Duration) {
 		claude := tick%5 == 0 && s.claude.Refresh()
 		if plans || claude {
 			s.publish(false)
+		}
+	}
+}
+
+// githubLoop refreshes PRs, issues and CI every few minutes, sooner after R.
+func (s *Server) githubLoop() {
+	maxAge := githubEvery
+	for {
+		s.mu.RLock()
+		items, off := s.items, s.githubOff
+		s.mu.RUnlock()
+		if items != nil && !off && s.gh.refresh(items, maxAge) {
+			s.publish(false)
+		}
+		maxAge = githubEvery
+		select {
+		case <-time.After(time.Minute):
+		case <-s.ghKick:
+			maxAge = 30 * time.Second
 		}
 	}
 }
@@ -146,20 +176,30 @@ func (s *Server) rescan() {
 	stacks := findStacks(s.root, board, cfg)
 	s.claude.Refresh() // skipped while the startup index is still running
 	s.mu.Lock()
+	first := s.items == nil
 	s.items, s.stacks, s.cfgErr = board, stacks, cfgErr
+	s.githubOff = cfg.GitHub != nil && !*cfg.GitHub
 	s.mu.Unlock()
 	s.publish(false)
+	if first {
+		notify(s.ghKick)
+	}
 }
 
 // publish rebuilds the snapshot and wakes subscribers if anything changed.
 func (s *Server) publish(scanning bool) {
 	plans, plansErr := s.plans.All()
+	github, ghStatus := s.gh.snapshot()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	snap := Snapshot{
 		Root: s.root, ScannedAt: time.Now(), Scanning: scanning, ConfigPath: s.cfgPath, ConfigError: s.cfgErr,
 		Projects: s.items, Stacks: s.stacks,
 		Plans: plans, PlansPath: s.plans.path, Claude: map[string]ClaudeSummary{},
+		GitHub: github, GitHubStatus: ghStatus,
+	}
+	if s.githubOff {
+		snap.GitHub, snap.GitHubStatus = map[string]GitHubInfo{}, "off in config.yaml"
 	}
 	if plansErr != nil {
 		snap.PlansError = plansErr.Error()
@@ -238,12 +278,17 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("POST /api/open", s.open)
 	mux.HandleFunc("POST /api/rescan", func(w http.ResponseWriter, r *http.Request) {
 		s.requestScan()
+		notify(s.ghKick)
 		w.WriteHeader(http.StatusAccepted)
 	})
 	mux.HandleFunc("POST /api/procs/start", s.startProc)
 	mux.HandleFunc("POST /api/procs/{action}", s.procAction)
 	mux.HandleFunc("GET /api/procs/term", s.term)
 	mux.HandleFunc("POST /api/plan", s.updatePlan)
+	mux.HandleFunc("GET /api/graveyard", s.graveyard)
+	mux.HandleFunc("POST /api/graveyard/undo", s.unbury)
+	mux.HandleFunc("POST /api/graveyard/{action}", s.bury)
+	mux.HandleFunc("POST /api/git/{action}", s.gitOp)
 	mux.HandleFunc("GET /api/claude", func(w http.ResponseWriter, r *http.Request) {
 		rel := r.URL.Query().Get("id")
 		if s.find(rel) == nil {
@@ -348,7 +393,8 @@ func (s *Server) branches(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, bl)
+	undo, _ := s.gitlog.lastBatch(it.Path)
+	writeJSON(w, branchesWithUndo{BranchList: bl, Undo: undo})
 }
 
 func (s *Server) open(w http.ResponseWriter, r *http.Request) {

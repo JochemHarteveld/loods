@@ -7,12 +7,22 @@ export type Command = {
 	url?: string;
 };
 
+export type Warning = {
+	level: 'danger' | 'warn' | 'info';
+	kind: string;
+	text: string;
+	fix?: 'cleanup-branches' | 'prune-worktrees' | 'ignore-env';
+};
+
 export type Project = {
 	path: string;
 	rel: string; // stable id
 	name: string;
 	group: string;
-	kind: 'git' | 'proj';
+	kind: 'git' | 'proj' | 'dir' | 'zip'; // dir and zip only in the Graveyard
+	size_bytes?: number; // Graveyard only
+	possible_duplicates?: string[];
+	warnings?: Warning[];
 	stack?: string[];
 	last_activity: string;
 	last_file_change: string;
@@ -67,6 +77,18 @@ export type ClaudeSession = {
 	active_mins: number;
 };
 
+export type PR = {
+	number: number;
+	title: string;
+	branch: string;
+	draft?: boolean;
+	url: string;
+	review?: string;
+	checks?: 'pass' | 'fail' | 'pending';
+};
+export type Run = { workflow: string; branch: string; status: string; conclusion: string; url: string; created_at: string };
+export type GitHubInfo = { repo: string; branch: string; prs: PR[]; issues: number; ci?: Run; error?: string; fetched_at: string };
+
 export type Snapshot = {
 	root: string;
 	scanned_at: string;
@@ -79,6 +101,8 @@ export type Snapshot = {
 	plans_path: string;
 	plans_error?: string;
 	claude: Record<string, ClaudeSummary>;
+	github: Record<string, GitHubInfo>;
+	github_status?: string;
 };
 
 export type Proc = {
@@ -119,7 +143,13 @@ export type Branch = {
 	worktree?: string;
 };
 
-export type BranchList = { default: string; branches: Branch[] };
+export type UndoInfo = { batch: string; time: string; branches: string[]; worktrees: number };
+export type BranchList = { default: string; branches: Branch[]; undo?: UndoInfo };
+export type OpResult = { name: string; ok: boolean; note?: string; error?: string };
+
+export type Batch = { batch: string; time: string; action: 'archive' | 'trash'; items: string[]; restored?: boolean };
+export type GraveyardData = { scanned_at: string; archive: string; items: Project[]; batches: Batch[] };
+export type GitAction = 'delete-branches' | 'undo' | 'prune-worktrees' | 'ignore-env';
 
 export type Target = 'code' | 'terminal' | 'folder' | 'github';
 
@@ -148,6 +178,17 @@ export const procAction = (action: 'stop' | 'restart' | 'remove' | 'input', id: 
 
 export const fetchBranches = (id: string) => get<BranchList>('/api/branches?id=' + encodeURIComponent(id));
 export const fetchSessions = (id: string) => get<ClaudeSession[]>('/api/claude?id=' + encodeURIComponent(id));
+export const gitOp = async (action: GitAction, project: string, branches?: string[]): Promise<OpResult[]> =>
+	(await post('/api/git/' + action, { project, branches })).json();
+export const fetchGraveyard = (fresh = false) => get<GraveyardData>('/api/graveyard' + (fresh ? '?fresh=1' : ''));
+export const bury = async (action: 'archive' | 'trash', rels: string[]): Promise<OpResult[]> =>
+	(await post('/api/graveyard/' + action, { rels })).json();
+export const unbury = async (): Promise<OpResult[]> => (await post('/api/graveyard/undo', {})).json();
+
+/** CI state of a run: pass, fail or pending. */
+export const runState = (r: Run) =>
+	r.status !== 'completed' ? 'pending' : ['success', 'neutral', 'skipped'].includes(r.conclusion) ? 'pass' : 'fail';
+
 export const updatePlan = async (project: string, patch: PlanPatch): Promise<Plan> =>
 	(await post('/api/plan', { project, patch })).json();
 
