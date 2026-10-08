@@ -4,6 +4,10 @@
 	import '@xterm/xterm/css/xterm.css';
 
 	let { id }: { id: string } = $props();
+	// Props are getters: reading `id` in the effect would also subscribe it to the
+	// parent's whole proc object, rebuilding the terminal on every procs update.
+	// A derived only changes when the id string does.
+	const procKey = $derived(id);
 
 	let el: HTMLDivElement;
 	let term: Terminal | undefined;
@@ -15,7 +19,7 @@
 	// One terminal + websocket per process. The server replays the backlog on
 	// connect, so switching processes or reconnecting shows the full history.
 	$effect(() => {
-		const procId = id;
+		const procId = procKey;
 		const css = getComputedStyle(document.documentElement);
 		const v = (name: string) => css.getPropertyValue(name).trim();
 		const t = new Terminal({
@@ -41,7 +45,9 @@
 			ws = new WebSocket(`${proto}://${location.host}/api/procs/term?id=${encodeURIComponent(procId)}`);
 			ws.binaryType = 'arraybuffer';
 			ws.onopen = () => {
-				t.reset();
+				// Reset in the write queue rather than now, so the old screen stays up
+				// until the backlog replaces it in the same pass instead of flashing blank.
+				t.write('\x1bc');
 				send({ type: 'resize', cols: t.cols, rows: t.rows });
 			};
 			ws.onmessage = (e) => t.write(new Uint8Array(e.data as ArrayBuffer));

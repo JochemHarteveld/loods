@@ -131,9 +131,8 @@ func (m *Manager) read(p *Proc) {
 			for ch := range p.subs {
 				select {
 				case ch <- chunk:
-				default: // viewer too slow: drop it, it reconnects and replays the backlog
-					close(ch)
-					delete(p.subs, ch)
+				default:
+					resync(ch, p.out)
 				}
 			}
 			m.mu.Unlock()
@@ -258,6 +257,20 @@ func (m *Manager) Remove(id string) error {
 	m.procs = slices.Delete(m.procs, i, i+1)
 	go m.onChange()
 	return nil
+}
+
+// resync catches up a viewer whose queue is full. Dropping it would make the
+// browser reconnect and redraw from scratch (a visible flash), so instead its
+// queue is replaced in-band by a terminal reset plus the whole backlog.
+// Only read() sends on ch and it holds the lock, so after draining there's room.
+func resync(ch chan []byte, backlog []byte) {
+	for len(ch) > 0 {
+		select {
+		case <-ch:
+		default:
+		}
+	}
+	ch <- append([]byte("\x1bc"), backlog...)
 }
 
 func (m *Manager) dropSubsLocked(p *Proc) {

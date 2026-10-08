@@ -606,6 +606,34 @@ func (s *Server) term(w http.ResponseWriter, r *http.Request) {
 				c.Close(websocket.StatusNormalClosure, "detached")
 				return
 			}
+			// Programs redraw in bursts of tiny writes (docker compose's menu bar:
+			// a dozen writes over ~2ms per log line). Sent one by one, the browser
+			// paints half-finished redraws, which flickers. So gather output until
+			// it goes quiet briefly and send it as one frame. Chunks are shared
+			// between viewers, so build a fresh buffer.
+			b = append([]byte(nil), b...)
+			flush := time.After(16 * time.Millisecond)
+			for gather := true; gather && len(b) < 1<<20; {
+				quiet := time.NewTimer(3 * time.Millisecond)
+				select {
+				case next, ok := <-ch:
+					if !ok {
+						gather = false
+						break
+					}
+					if bytes.HasPrefix(next, []byte("\x1bc")) {
+						b = b[:0] // a resync replaces everything before it
+					}
+					b = append(b, next...)
+				case <-quiet.C:
+					gather = false
+				case <-flush:
+					gather = false
+				case <-ctx.Done():
+					return
+				}
+				quiet.Stop()
+			}
 			if err := c.Write(ctx, websocket.MessageBinary, b); err != nil {
 				return
 			}

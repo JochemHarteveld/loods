@@ -197,3 +197,16 @@ func TestApplyConfig(t *testing.T) {
 		t.Errorf("default = %q", it.DefaultCommand)
 	}
 }
+
+func TestResyncReplacesFullQueue(t *testing.T) {
+	ch := make(chan []byte, 2)
+	ch <- []byte("a")
+	ch <- []byte("b")
+	resync(ch, []byte("log"))
+	if len(ch) != 1 {
+		t.Fatalf("queue has %d items, want 1", len(ch))
+	}
+	if got := string(<-ch); got != "\x1bclog" {
+		t.Fatalf("got %q, want reset + backlog", got)
+	}
+}
