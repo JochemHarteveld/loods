@@ -2,8 +2,8 @@
 	import { onMount, tick } from 'svelte';
 	import Card from './Card.svelte';
 	import Detail from './Detail.svelte';
-	import Garage, { type ProcAction } from './Garage.svelte';
-	import Plans, { type Column } from './Plans.svelte';
+	import { type ProcAction } from './Garage.svelte';
+	import ProjectPage, { TABS, type Tab } from './ProjectPage.svelte';
 	import Hygiene, { type Row } from './Hygiene.svelte';
 	import Graveyard from './Graveyard.svelte';
 	import {
@@ -15,6 +15,7 @@
 		isAlive,
 		openIn,
 		procAction,
+		releaseClaim,
 		rescan,
 		startCommand,
 		startStack,
@@ -22,6 +23,7 @@
 		updatePlan,
 		type Branch,
 		type BranchList,
+		type Claim,
 		type ClaudeSummary,
 		type GitHubInfo,
 		type GraveyardData,
@@ -32,15 +34,35 @@
 		type Project,
 		type Stack,
 		type Status,
-		type Target
+		type Target,
+		type Task,
+		type TaskState
 	} from './lib/api';
-	import { COLUMNS, nextPriority, prioRank, statusLabel } from './lib/plan';
+	import { claimStale, COLUMNS, moveTask, nextPriority, prioRank, statusLabel, TASK_STATES } from './lib/plan';
 	import { findings, type Finding } from './lib/hygiene';
 	import { ago, bytes } from './lib/time';
 
 	type Group = { name: string; items: Project[]; latest: number };
-	type View = 'board' | 'plans' | 'garage' | 'hygiene' | 'graveyard';
-	const VIEWS: View[] = ['board', 'plans', 'garage', 'hygiene', 'graveyard'];
+	// Top-level views. Everything about one project — its planboard, its garage
+	// and its git state — lives on that project's own page.
+	type View = 'board' | 'hygiene' | 'graveyard' | 'project';
+	const VIEWS: View[] = ['board', 'hygiene', 'graveyard'];
+	type Route = { view: View; rel?: string; tab?: Tab };
+
+	// Routes: '', '#hygiene', '#graveyard', '#p/<rel>' and '#p/<rel>!<tab>'.
+	function parseHash(hash: string): Route {
+		const s = hash.replace(/^#/, '');
+		if (s.startsWith('p/')) {
+			const [rel, tab] = s.slice(2).split('!');
+			return { view: 'project', rel: decodeURIComponent(rel), tab: (TABS as string[]).includes(tab) ? (tab as Tab) : 'plan' };
+		}
+		return { view: (VIEWS as string[]).includes(s) ? (s as View) : 'board' };
+	}
+
+	function hashOf(r: Route): string {
+		if (r.view === 'project' && r.rel) return `#p/${encodeURIComponent(r.rel)}${r.tab && r.tab !== 'plan' ? '!' + r.tab : ''}`;
+		return r.view === 'board' ? '' : '#' + r.view;
+	}
 	type ConfirmLine = { text: string; sub?: string; danger?: boolean };
 	type Confirm = {
 		title: string;
@@ -56,6 +78,7 @@
 	let procs = $state<Proc[]>([]);
 	let plans = $state<Record<string, Plan>>({});
 	let claude = $state<Record<string, ClaudeSummary>>({});
+	let claims = $state<Record<string, Claim>>({});
 	let github = $state<Record<string, GitHubInfo>>({});
 	let githubStatus = $state('');
 	let hyIndex = $state(0);
@@ -79,7 +102,11 @@
 	let connected = $state(false);
 	let loaded = $state(false);
 	let now = $state(Date.now());
-	let view = $state<View>(VIEWS.find((v) => '#' + v === location.hash) ?? 'board');
+	const start = parseHash(location.hash);
+	let view = $state<View>(start.view);
+	let projectRel = $state<string | null>(start.rel ?? null);
+	let projectTab = $state<Tab>(start.tab ?? 'plan');
+	let taskSel = $state(0);
 	let query = $state('');
 	let sortBy = $state<'activity' | 'priority' | 'name'>('activity');
 	let selectedId = $state<string | null>(null);
@@ -88,10 +115,9 @@
 	let helpOpen = $state(false);
 	let picker = $state<{ project: Project; index: number } | null>(null);
 	let statusPicker = $state<Project | null>(null);
-	let detail = $state<ReturnType<typeof Detail>>();
 	let toast = $state<{ text: string; error: boolean } | null>(null);
 	let filterEl = $state<HTMLInputElement>();
-	let garage = $state<ReturnType<typeof Garage>>();
+	let page = $state<ReturnType<typeof ProjectPage>>();
 	let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const time = (p: Project) => Date.parse(p.last_activity) || 0;
@@ -129,11 +155,9 @@
 		return list;
 	});
 	const flat = $derived(groups.flatMap((g) => g.items));
-	const kanban = $derived<Column[]>(
-		COLUMNS.map((status) => ({ status, items: filtered.filter((p) => (plans[p.rel]?.status ?? '') === status).sort(byPriority) }))
-	);
 	const selected = $derived(filtered.find((p) => p.rel === selectedId) ?? null);
-	const runningRels = $derived(new Set(procs.filter(isAlive).map((p) => p.project ?? '')));
+	// The project page works on the project itself, filter or no filter.
+	const project = $derived(projects.find((p) => p.rel === projectRel) ?? null);
 	const findingsOf = (p: Project) => findings(p, github[p.rel]);
 	const levelRank = { danger: 0, warn: 1, info: 2 };
 	// Hygiene rows: projects with the worst findings first.
@@ -153,25 +177,73 @@
 		return list;
 	});
 	// Visual order of the current view, for keeping a valid selection.
-	const order = $derived(view === 'plans' ? kanban.flatMap((c) => c.items) : view === 'hygiene' ? hygieneRows.map((r) => r.p) : flat);
+	const order = $derived(view === 'hygiene' ? hygieneRows.map((r) => r.p) : flat);
 	const live = $derived(procs.filter(isAlive));
 	const liveRSS = $derived(live.reduce((sum, p) => sum + (p.rss_bytes ?? 0), 0));
 	const memUsed = $derived(mem.total ? 1 - mem.available / mem.total : 0);
 	const procsOf = (rel: string) => live.filter((p) => p.project === rel);
-	const selectedProc = $derived(procs.find((p) => p.id === selectedProcId) ?? null);
-	const drawerView = $derived(view === 'board' || view === 'plans' || view === 'hygiene');
+	// space opens the details drawer for a quick peek without leaving the list.
+	const drawerView = $derived(view === 'board' || view === 'hygiene');
 
-	// The view lives in the URL hash, so a reload or bookmark keeps it.
+	// The project page's garage shows this project's processes plus the stacks of
+	// its group, which start several projects of that group at once.
+	const groupStacks = $derived(project ? stacks.filter((s) => s.name === project.group) : []);
+	const projectProcs = $derived.by(() => {
+		if (!project) return [];
+		const stackIds = new Set(groupStacks.map((s) => 'stack:' + s.name));
+		return procs.filter((pr) => pr.project === project.rel || stackIds.has(pr.id));
+	});
+	// Garage keys act on a process of the open project, never on someone else's.
+	const selectedProc = $derived(projectProcs.find((p) => p.id === selectedProcId) ?? null);
+
+	const tasks = $derived(project ? (plans[project.rel]?.tasks ?? []) : []);
+	// Claims of the open project, by task number, for the planboard.
+	const projectClaims = $derived.by(() => {
+		const out: Record<number, Claim> = {};
+		if (!project) return out;
+		for (const c of Object.values(claims)) if (c.project === project.rel) out[c.task] = c;
+		return out;
+	});
+	// How many tasks an agent is on, per project, for the board cards.
+	const workingPer = $derived.by(() => {
+		const out: Record<string, number> = {};
+		for (const c of Object.values(claims)) if (!claimStale(c, now)) out[c.project] = (out[c.project] ?? 0) + 1;
+		return out;
+	});
+	const working = $derived(Object.values(workingPer).reduce((n, v) => n + v, 0));
+	// Planboard columns, as cells that remember each task's index in the plan.
+	const taskCols = $derived(TASK_STATES.map((st) => tasks.map((t, i) => ({ t, i })).filter((c) => (c.t.state ?? '') === st)));
+
+	// The view (and which project page) lives in the URL hash, so a reload or a
+	// bookmark comes back to the same place.
 	$effect(() => {
-		history.replaceState(null, '', view === 'board' ? location.pathname : '#' + view);
+		const h = hashOf({ view, rel: projectRel ?? undefined, tab: projectTab });
+		history.replaceState(null, '', h || location.pathname);
+	});
+
+	// A project that disappears (renamed, archived) sends you back to the board.
+	$effect(() => {
+		if (view === 'project' && loaded && !project) {
+			view = 'board';
+			projectRel = null;
+		}
+	});
+
+	// Keep the planboard selection on a task that exists.
+	$effect(() => {
+		if (taskSel >= tasks.length) taskSel = Math.max(0, tasks.length - 1);
+	});
+
+	// The project garage selects one of this project's own processes.
+	$effect(() => {
+		if (view === 'project' && projectProcs.length && !projectProcs.some((pr) => pr.id === selectedProcId)) {
+			selectedProcId = projectProcs[0].id;
+		}
 	});
 
 	// Keep valid selections when filter or data change.
 	$effect(() => {
 		if (!selected && order.length) selectedId = order[0].rel;
-	});
-	$effect(() => {
-		if (!selectedProc && procs.length) selectedProcId = procs[0].id;
 	});
 	$effect(() => {
 		if (hyIndex >= hygieneRows.length) hyIndex = Math.max(0, hygieneRows.length - 1);
@@ -194,6 +266,7 @@
 				stacks = s.stacks;
 				plans = s.plans ?? {};
 				claude = s.claude ?? {};
+				claims = s.claims ?? {};
 				github = s.github ?? {};
 				githubStatus = s.github_status ?? '';
 				plansPath = s.plans_path;
@@ -212,9 +285,17 @@
 			(up) => (connected = up)
 		);
 		const clock = setInterval(() => (now = Date.now()), 15_000);
+		const onhash = () => {
+			const r = parseHash(location.hash);
+			view = r.view;
+			projectRel = r.rel ?? null;
+			projectTab = r.tab ?? 'plan';
+		};
+		addEventListener('hashchange', onhash);
 		return () => {
 			stop();
 			clearInterval(clock);
+			removeEventListener('hashchange', onhash);
 		};
 	});
 
@@ -412,9 +493,24 @@
 		selectedProcId = id;
 	}
 
+	// Open a project's own page. Tabs: planboard, garage, git.
+	function openProject(rel: string, tab: Tab = 'plan') {
+		projectRel = rel;
+		projectTab = tab;
+		taskSel = 0;
+		view = 'project';
+		detailOpen = false;
+	}
+
+	// Show a process in the garage of the project it belongs to. A stack has no
+	// project of its own, so its group's first project hosts it.
 	function showProc(id: string) {
 		selectedProcId = id;
-		view = 'garage';
+		const pr = procs.find((x) => x.id === id);
+		const group = pr?.id.startsWith('stack:') ? pr.id.slice(6) : '';
+		const rel = pr?.project ?? projects.find((x) => x.group === group)?.rel;
+		if (rel) openProject(rel, 'garage');
+		else flash('That process belongs to no project on the board', true);
 	}
 
 	function stopProject(p: Project | null) {
@@ -472,14 +568,108 @@
 		savePlan(p, { priority: n }, `${p.name}: ${n ? 'P' + n : 'no priority'}`);
 	}
 
-	// n / a / N: open the drawer on the field to edit.
-	async function editPlan(field: 'next' | 'task' | 'notes') {
-		if (!selected) return;
-		detailOpen = true;
+	// n / a / N: go to the project's planboard with that field ready to type in.
+	async function editPlan(field: 'next' | 'task' | 'notes', p: Project | null = selected) {
+		if (!p) return;
+		if (view !== 'project' || projectRel !== p.rel) openProject(p.rel, 'plan');
+		else projectTab = 'plan';
 		await tick();
-		if (field === 'next') detail?.focusNext();
-		else if (field === 'task') detail?.focusTask();
-		else detail?.focusNotes();
+		if (field === 'next') page?.focusNext();
+		else if (field === 'task') page?.addTask(selectedTaskState());
+		else page?.focusNotes();
+	}
+
+	/** Column the planboard selection sits in, so a adds a task right there. */
+	function selectedTaskState(): TaskState {
+		return tasks[taskSel]?.state ?? '';
+	}
+
+	function saveTasks(p: Project, next: Task[], note?: string) {
+		savePlan(p, note ? { tasks: next, note } : { tasks: next });
+	}
+
+	/** H / L on the planboard: move the selected task one column. */
+	function shiftTask(step: number) {
+		if (!project) return;
+		const t = tasks[taskSel];
+		if (!t) return;
+		const i = TASK_STATES.indexOf(t.state ?? '');
+		const to = TASK_STATES[i + step];
+		if (to === undefined) return;
+		const next = moveTask(tasks, taskSel, to);
+		taskSel = next.length - 1; // moveTask puts it at the end of its column
+		saveTasks(project, next);
+	}
+
+	/** space on the planboard: done ⇄ to do, the one move worth a single key. */
+	function toggleTask() {
+		if (!project || !tasks[taskSel]) return;
+		const next = moveTask(tasks, taskSel, tasks[taskSel].state === 'done' ? '' : 'done');
+		taskSel = next.length - 1;
+		saveTasks(project, next);
+	}
+
+	// del on the planboard. A keystroke away from losing text, so it asks first;
+	// the ✕ on a card is a deliberate click and deletes straight away.
+	function deleteTask() {
+		const p = project;
+		const t = p && tasks[taskSel];
+		if (!p || !t) return;
+		const i = taskSel;
+		confirm = {
+			title: `Delete this task in ${p.name}`,
+			lines: [{ text: t.text }],
+			label: 'Deleted',
+			run: async () => {
+				taskSel = Math.max(0, i - 1);
+				saveTasks(p, tasks.filter((_, j) => j !== i));
+			}
+		};
+	}
+
+	// X on the planboard: take a task back from an agent that is not coming back.
+	// It asks first, because a live agent will keep working and reclaim it.
+	function releaseTask() {
+		const p = project;
+		const t = p && tasks[taskSel];
+		const c = t?.id ? projectClaims[t.id] : undefined;
+		if (!p || !t || !c) return flash('No agent on this task');
+		const stale = claimStale(c, now);
+		confirm = {
+			title: `Free ${p.name}#${t.id} from ${c.agent}`,
+			lines: [{ text: t.text, sub: `${stale ? 'no heartbeat for' : 'working, last heartbeat'} ${ago(c.last_heartbeat, now)}`, danger: !stale }],
+			note: stale
+				? 'The agent stopped reporting in. Freeing it only removes the claim; the task stays in progress.'
+				: 'This agent still reports in. If it is really running, it will carry on and claim the task again.',
+			label: 'Freed',
+			danger: !stale,
+			run: () => attempt(() => releaseClaim(p.rel, t.id!))
+		};
+	}
+
+	// Planboard movement: h/l across columns keeping the row, j/k within one.
+	function moveTaskSel(dir: 'left' | 'right' | 'up' | 'down') {
+		const ci = taskCols.findIndex((col) => col.some((c) => c.i === taskSel));
+		if (ci < 0) {
+			const first = taskCols.flat()[0];
+			if (first) taskSel = first.i;
+			return;
+		}
+		const col = taskCols[ci];
+		const ri = col.findIndex((c) => c.i === taskSel);
+		if (dir === 'up') taskSel = col[Math.max(0, ri - 1)].i;
+		else if (dir === 'down') taskSel = col[Math.min(col.length - 1, ri + 1)].i;
+		else {
+			const step = dir === 'left' ? -1 : 1;
+			for (let j = ci + step; j >= 0 && j < taskCols.length; j += step) {
+				const other = taskCols[j];
+				if (other.length) {
+					taskSel = other[Math.min(ri, other.length - 1)].i;
+					break;
+				}
+			}
+		}
+		tick().then(() => document.querySelector(`[data-task="${taskSel}"]`)?.scrollIntoView({ block: 'nearest' }));
 	}
 
 	const cardEl = (id: string) => document.querySelector<HTMLElement>(`[data-id="${CSS.escape(id)}"]`);
@@ -519,29 +709,6 @@
 		if (best >= 0) select(flat[best]);
 	}
 
-	// Kanban: h/l jump to the next column that has cards, j/k move within one.
-	function moveKanban(dir: 'left' | 'right' | 'up' | 'down') {
-		const ci = kanban.findIndex((c) => c.items.some((p) => p.rel === selectedId));
-		if (ci < 0) return select(order[0]);
-		const items = kanban[ci].items;
-		const ri = items.findIndex((p) => p.rel === selectedId);
-		if (dir === 'up') return select(items[Math.max(0, ri - 1)]);
-		if (dir === 'down') return select(items[Math.min(items.length - 1, ri + 1)]);
-		const step = dir === 'left' ? -1 : 1;
-		for (let j = ci + step; j >= 0 && j < kanban.length; j += step) {
-			const col = kanban[j].items;
-			if (col.length) return select(col[Math.min(ri, col.length - 1)]);
-		}
-	}
-
-	// H / L on the kanban: move the card one column, empty columns included.
-	function shiftStatus(step: number) {
-		if (!selected) return;
-		const i = COLUMNS.indexOf(plans[selected.rel]?.status ?? '');
-		const j = i + step;
-		if (j >= 0 && j < COLUMNS.length) setStatus(selected, COLUMNS[j]);
-	}
-
 	function moveHygiene(delta: number) {
 		if (!hygieneRows.length) return;
 		hyIndex = Math.min(hygieneRows.length - 1, Math.max(0, hyIndex + delta));
@@ -556,14 +723,16 @@
 		tick().then(() => cardEl(next.rel)?.scrollIntoView({ block: 'nearest' }));
 	}
 
+	// j / k in a project's garage walk that project's own processes.
 	function moveProc(delta: number) {
-		if (!procs.length) return;
-		const i = procs.findIndex((p) => p.id === selectedProcId);
-		selectedProcId = procs[Math.min(procs.length - 1, Math.max(0, i + delta))].id;
+		const list = projectProcs;
+		if (!list.length) return;
+		const i = list.findIndex((p) => p.id === selectedProcId);
+		selectedProcId = list[Math.min(list.length - 1, Math.max(0, i + delta))].id;
 	}
 
 	function focusFilter() {
-		if (view === 'garage') view = 'board';
+		if (view === 'project') view = 'board';
 		tick().then(() => {
 			filterEl?.focus();
 			filterEl?.select();
@@ -658,12 +827,9 @@
 			case 'ArrowDown':
 			case 'j':
 				return move('down');
-			case 'L': {
-				const mine = selected ? procs.filter((p) => p.project === selected.rel) : [];
-				if (mine.length) showProc((mine.find(isAlive) ?? mine[0]).id);
-				else flash('No processes for this project yet');
-				return;
-			}
+			case 'L':
+				if (!selected) return;
+				return openProject(selected.rel, 'garage');
 			case 's':
 				sortBy = sortBy === 'activity' ? 'priority' : sortBy === 'priority' ? 'name' : 'activity';
 				flash(`Sorted by ${sortBy}`);
@@ -672,32 +838,12 @@
 		return projectKey(e);
 	}
 
-	function plansKey(e: KeyboardEvent) {
-		switch (e.key) {
-			case 'ArrowLeft':
-			case 'h':
-				return moveKanban('left');
-			case 'ArrowRight':
-			case 'l':
-				return moveKanban('right');
-			case 'ArrowUp':
-			case 'k':
-				return moveKanban('up');
-			case 'ArrowDown':
-			case 'j':
-				return moveKanban('down');
-			case 'H':
-				return shiftStatus(-1);
-			case 'L':
-				return shiftStatus(1);
-		}
-		return projectKey(e);
-	}
-
-	// Keys that act on the selected project, on the Board and on Plans.
+	// Keys that act on the project under the cursor, on the Board and in Hygiene.
 	function projectKey(e: KeyboardEvent) {
 		switch (e.key) {
 			case 'Enter':
+				if (selected) return openProject(selected.rel);
+				return;
 			case ' ':
 				detailOpen = !detailOpen;
 				return;
@@ -734,6 +880,85 @@
 		return false;
 	}
 
+	// On a project page: esc leaves, 1–3 pick the tab, the rest is the tab's own.
+	function projectPageKey(e: KeyboardEvent) {
+		if (e.key === 'Escape') {
+			view = 'board';
+			if (projectRel) selectedId = projectRel;
+			return;
+		}
+		if (/^[1-3]$/.test(e.key)) {
+			projectTab = TABS[+e.key - 1];
+			return;
+		}
+		if (projectTab === 'garage') return garageKey(e);
+		if (projectTab === 'plan' && planTabKey(e) !== false) return;
+		return pageProjectKey(e);
+	}
+
+	function planTabKey(e: KeyboardEvent) {
+		switch (e.key) {
+			case 'ArrowLeft':
+			case 'h':
+				return moveTaskSel('left');
+			case 'ArrowRight':
+			case 'l':
+				return moveTaskSel('right');
+			case 'ArrowUp':
+			case 'k':
+				return moveTaskSel('up');
+			case 'ArrowDown':
+			case 'j':
+				return moveTaskSel('down');
+			case 'H':
+				return shiftTask(-1);
+			case 'L':
+				return shiftTask(1);
+			case ' ':
+				return toggleTask();
+			case 'Enter':
+				return page?.editTask(taskSel);
+			case 'Delete':
+			case 'Backspace':
+				return deleteTask();
+			case 'X':
+				return releaseTask();
+		}
+		return false;
+	}
+
+	// Keys that act on the project whose page is open.
+	function pageProjectKey(e: KeyboardEvent) {
+		switch (e.key) {
+			case 'c':
+				return act(project, 'code');
+			case 't':
+				return act(project, 'terminal');
+			case 'o':
+				return act(project, 'folder');
+			case 'g':
+				return act(project, 'github');
+			case 'r':
+				return project && run(project);
+			case 'x':
+				return stopProject(project);
+			case 'w':
+				return openURL(project && procsOf(project.rel).find((pr) => pr.urls?.length));
+			case 'a':
+				return editPlan('task', project);
+			case 'n':
+				return editPlan('next', project);
+			case 'N':
+				return editPlan('notes', project);
+			case 'p':
+				return cyclePriority(project);
+			case 'm':
+				statusPicker = project;
+				return;
+		}
+		return false;
+	}
+
 	function garageKey(e: KeyboardEvent) {
 		const p = selectedProc;
 		switch (e.key) {
@@ -745,7 +970,7 @@
 				return moveProc(-1);
 			case 'i':
 			case 'Enter':
-				return garage?.focusTerminal();
+				return page?.focusTerminal();
 			case 'x':
 				return p && isAlive(p) && onProcAction('stop', p);
 			case 'r':
@@ -759,11 +984,8 @@
 			case 'Delete':
 			case 'Backspace':
 				return p && !isAlive(p) && onProcAction('remove', p);
-			case 'Escape':
-				view = 'board';
-				return;
 		}
-		return false;
+		return pageProjectKey(e);
 	}
 
 	function onkeydown(e: KeyboardEvent) {
@@ -799,14 +1021,14 @@
 			e.preventDefault();
 			return;
 		}
+		// 1–3 switch top-level views, except on a project page, where they pick the
+		// project's own tab.
+		if (view !== 'project' && /^[1-3]$/.test(e.key)) {
+			view = VIEWS[+e.key - 1];
+			e.preventDefault();
+			return;
+		}
 		switch (e.key) {
-			case '1':
-			case '2':
-			case '3':
-			case '4':
-			case '5':
-				view = VIEWS[+e.key - 1];
-				break;
 			case '/':
 				focusFilter();
 				break;
@@ -819,7 +1041,7 @@
 				break;
 			default:
 				{
-					const handle = { board: boardKey, plans: plansKey, garage: garageKey, hygiene: hygieneKey, graveyard: graveKey }[view];
+					const handle = { board: boardKey, hygiene: hygieneKey, graveyard: graveKey, project: projectPageKey }[view];
 					if (handle(e) === false) return;
 				}
 		}
@@ -827,26 +1049,33 @@
 	}
 
 	const keys: [string, string, string][] = [
-		['1 – 5', 'Board · Plans · Garage · Hygiene · Graveyard', 'any'],
+		['1 – 3', 'Board · Hygiene · Graveyard', 'board, hygiene, graveyard'],
 		['/  ctrl+k', 'filter projects (also matches status and next step)', 'any'],
 		['R', 'rescan now', 'any'],
-		['←↓↑→ / hjkl', 'move', 'board, plans'],
-		['enter', 'details, plan & branches', 'board, plans'],
-		['n · a · N', 'edit next step · add task · notes', 'board, plans'],
-		['m', 'set status (0 inbox, 1–5)', 'board, plans'],
-		['p', 'cycle priority P1 → P2 → P3 → none', 'board, plans'],
-		['H / L', 'move card one column left / right', 'plans'],
-		['c · t · o · g', 'VS Code · terminal · folder · remote', 'board, plans'],
-		['r', 'run (asks when there are several commands)', 'board, plans'],
-		['x', 'stop everything of this project', 'board, plans'],
-		['L', 'show its logs in the Garage', 'board'],
-		['w', 'open its web URL', 'board, plans'],
+		['←↓↑→ / hjkl', 'move', 'board, planboard'],
+		['enter', 'open the project page', 'board'],
+		['space', 'details drawer: branches, PRs, findings', 'board'],
+		['L', 'open its garage', 'board'],
 		['s', 'sort by activity / priority / name', 'board'],
+		['esc', 'back to the board', 'project page'],
+		['1 – 3', 'Planboard · Garage · Git', 'project page'],
+		['c · t · o · g', 'VS Code · terminal · folder · remote', 'board, project page'],
+		['r', 'run (asks when there are several commands)', 'board, project page'],
+		['x', 'stop everything of this project', 'board, project page'],
+		['w', 'open its web URL', 'board, project page'],
+		['m', 'set status (0 inbox, 1–5)', 'board, project page'],
+		['p', 'cycle priority P1 → P2 → P3 → none', 'board, project page'],
+		['n · N', 'edit next step · notes', 'board, project page'],
+		['a', 'add a task in the selected column', 'board, planboard'],
+		['H / L', 'move a task one column left / right', 'planboard'],
+		['space', 'task done ⇄ to do', 'planboard'],
+		['enter', 'rename the selected task', 'planboard'],
+		['del', 'delete the selected task', 'planboard'],
+		['X', 'take a task back from an agent that stopped reporting in', 'planboard'],
 		['j / k', 'select process', 'garage'],
 		['i / enter', 'type into the terminal (esc leaves)', 'garage'],
 		['r · x', 'restart · stop (twice: kill)', 'garage'],
 		['u · U', 'flutter hot reload · hot restart', 'garage'],
-		['w', 'open URL', 'garage'],
 		['del', 'remove an exited process', 'garage'],
 		['j / k · enter', 'select · fix (asks first) or details', 'hygiene'],
 		['space', 'mark', 'graveyard'],
@@ -866,21 +1095,24 @@
 			<span>loods</span>
 		</div>
 		<nav>
-			<button class="tab" class:active={view === 'board'} onclick={() => (view = 'board')}>Board <kbd>1</kbd></button>
-			<button class="tab" class:active={view === 'plans'} onclick={() => (view = 'plans')}>Plans <kbd>2</kbd></button>
-			<button class="tab" class:active={view === 'garage'} onclick={() => (view = 'garage')}>
-				Garage
-				{#if live.length}<span class="count">{live.length}</span>{/if}
-				<kbd>3</kbd>
+			<button class="tab" class:active={view === 'board'} onclick={() => (view = 'board')}>
+				Board
+				{#if view !== 'project'}<kbd>1</kbd>{/if}
 			</button>
 			<button class="tab" class:active={view === 'hygiene'} onclick={() => (view = 'hygiene')}>
 				Hygiene
 				{#if attention}<span class="count warn">{attention}</span>{/if}
-				<kbd>4</kbd>
+				{#if view !== 'project'}<kbd>2</kbd>{/if}
 			</button>
-			<button class="tab" class:active={view === 'graveyard'} onclick={() => (view = 'graveyard')}>Graveyard <kbd>5</kbd></button>
+			<button class="tab" class:active={view === 'graveyard'} onclick={() => (view = 'graveyard')}>
+				Graveyard
+				{#if view !== 'project'}<kbd>3</kbd>{/if}
+			</button>
+			{#if view === 'project' && project}
+				<span class="crumb">/ {project.name}</span>
+			{/if}
 		</nav>
-		{#if view !== 'garage'}
+		{#if view !== 'project'}
 			<input
 				bind:this={filterEl}
 				bind:value={query}
@@ -897,7 +1129,9 @@
 					{#if liveRSS}<span class="muted">· {bytes(liveRSS)} here</span>{/if}
 				</span>
 			{/if}
-			{#if attention}<button class="attn" title="open Hygiene (4)" onclick={() => (view = 'hygiene')}>{attention} need attention</button>{/if}
+			{#if live.length}<span class="running" title="processes running in project garages">{live.length} running</span>{/if}
+			{#if working}<span class="working" title="tasks an agent is working on">✻ {working} with claude</span>{/if}
+			{#if attention}<button class="attn" title="open Hygiene (2)" onclick={() => (view = 'hygiene')}>{attention} need attention</button>{/if}
 			<span class="scan" class:busy={scanning} title={root}>
 				<span class="conn" class:up={connected}></span>
 				{scanning ? 'scanning…' : scannedAt ? (ago(scannedAt, now) === 'now' ? 'scanned just now' : `scanned ${ago(scannedAt, now)} ago`) : 'connecting…'}
@@ -940,9 +1174,10 @@
 									gh={github[p.rel]}
 									{now}
 									procs={procsOf(p.rel)}
+									working={workingPer[p.rel] ?? 0}
 									selected={p.rel === selectedId}
 									onselect={() => (selectedId = p.rel)}
-									ondetail={() => ((selectedId = p.rel), (detailOpen = true))}
+									ondetail={() => openProject(p.rel)}
 									onact={(t) => act(p, t)}
 								/>
 							{/each}
@@ -981,49 +1216,84 @@
 				onundo={undoBury}
 			/>
 		</main>
-	{:else if view === 'plans'}
-		<main class="plans-main">
-			<Plans
-				columns={kanban}
-				{plans}
-				{claude}
-				running={runningRels}
-				{selectedId}
-				{now}
-				onselect={(rel) => (selectedId = rel)}
-				ondetail={(rel) => ((selectedId = rel), (detailOpen = true))}
-				onmove={(rel, status) => setStatus(projects.find((p) => p.rel === rel) ?? null, status)}
-			/>
-		</main>
+	{:else if view === 'project' && project}
+		<ProjectPage
+			bind:this={page}
+			p={project}
+			plan={plans[project.rel]}
+			claude={claude[project.rel]}
+			gh={github[project.rel]}
+			findings={findingsOf(project)}
+			version={gitVersion}
+			tab={projectTab}
+			procs={projectProcs}
+			stacks={groupStacks}
+			{projects}
+			selectedProcId={selectedProcId}
+			{taskSel}
+			claims={projectClaims}
+			{now}
+			{configPath}
+			ontab={(t) => (projectTab = t)}
+			onback={() => ((view = 'board'), (selectedId = project.rel))}
+			onact={(t) => act(project, t)}
+			onrun={() => run(project)}
+			onstop={() => stopProject(project)}
+			oncommand={(name) => launch(project, name)}
+			onsave={(patch) => savePlan(project, patch)}
+			ontasks={(next, note) => saveTasks(project, next, note)}
+			ontaskselect={(i) => (taskSel = i)}
+			onrelease={(i) => ((taskSel = i), releaseTask())}
+			onprocselect={(id) => (selectedProcId = id)}
+			onprocaction={onProcAction}
+			onstack={onStack}
+			onfix={(f) => fixFinding(project, f)}
+			ondelete={(branches, data) => deleteBranches(project, branches, data)}
+			onundo={() => undoGit(project)}
+		/>
 	{:else}
-		<main class="garage-main">
-			<Garage
-				bind:this={garage}
-				{procs}
-				{stacks}
-				{projects}
-				{now}
-				{configPath}
-				selectedId={selectedProcId}
-				onselect={(id) => (selectedProcId = id)}
-				onaction={onProcAction}
-				onstack={onStack}
-			/>
-		</main>
+		<main><p class="empty">Loading project…</p></main>
 	{/if}
 
 	<footer class="keys">
 		{#if view === 'board'}
 			<span><kbd>hjkl</kbd> move</span>
-			<span><kbd>enter</kbd> details</span>
+			<span><kbd>enter</kbd> open project</span>
+			<span><kbd>space</kbd> details</span>
 			<span><kbd>r</kbd> run</span>
-			<span><kbd>x</kbd> stop</span>
-			<span><kbd>L</kbd> logs</span>
+			<span><kbd>L</kbd> garage</span>
 			<span><kbd>c</kbd> code</span>
 			<span><kbd>t</kbd> terminal</span>
 			<span><kbd>/</kbd> filter</span>
-			<span><kbd>n</kbd> next step</span>
 			<span><kbd>s</kbd> sort: {sortBy}</span>
+		{:else if view === 'project' && projectTab === 'plan'}
+			<span><kbd>esc</kbd> board</span>
+			<span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> plan · garage · git</span>
+			<span><kbd>hjkl</kbd> move</span>
+			<span><kbd>H</kbd><kbd>L</kbd> move task</span>
+			<span><kbd>a</kbd> add task</span>
+			<span><kbd>space</kbd> done</span>
+			<span><kbd>enter</kbd> rename</span>
+			<span><kbd>X</kbd> free from agent</span>
+			<span><kbd>n</kbd> next step</span>
+			<span><kbd>m</kbd> status</span>
+			<span><kbd>r</kbd> run</span>
+		{:else if view === 'project' && projectTab === 'garage'}
+			<span><kbd>esc</kbd> board</span>
+			<span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> plan · garage · git</span>
+			<span><kbd>j</kbd><kbd>k</kbd> select</span>
+			<span><kbd>i</kbd> type in terminal</span>
+			<span><kbd>r</kbd> restart</span>
+			<span><kbd>x</kbd> stop</span>
+			<span><kbd>u</kbd> reload</span>
+			<span><kbd>w</kbd> open URL</span>
+		{:else if view === 'project'}
+			<span><kbd>esc</kbd> board</span>
+			<span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> plan · garage · git</span>
+			<span><kbd>c</kbd> code</span>
+			<span><kbd>t</kbd> terminal</span>
+			<span><kbd>g</kbd> remote</span>
+			<span><kbd>r</kbd> run</span>
 		{:else if view === 'hygiene'}
 			<span><kbd>j</kbd><kbd>k</kbd> select</span>
 			<span><kbd>enter</kbd> fix / details</span>
@@ -1039,23 +1309,6 @@
 			<span><kbd>d</kbd> dupes{graveDupes ? ' ✓' : ''}</span>
 			<span><kbd>s</kbd> sort: {graveSort}</span>
 			<span><kbd>R</kbd> re-measure</span>
-		{:else if view === 'plans'}
-			<span><kbd>hjkl</kbd> move</span>
-			<span><kbd>H</kbd><kbd>L</kbd> move card</span>
-			<span><kbd>m</kbd> status</span>
-			<span><kbd>p</kbd> priority</span>
-			<span><kbd>n</kbd> next step</span>
-			<span><kbd>a</kbd> task</span>
-			<span><kbd>enter</kbd> details</span>
-			<span><kbd>/</kbd> filter</span>
-		{:else}
-			<span><kbd>j</kbd><kbd>k</kbd> select</span>
-			<span><kbd>i</kbd> type in terminal</span>
-			<span><kbd>r</kbd> restart</span>
-			<span><kbd>x</kbd> stop</span>
-			<span><kbd>u</kbd> reload</span>
-			<span><kbd>w</kbd> open URL</span>
-			<span><kbd>esc</kbd> board</span>
 		{/if}
 		<span><kbd>?</kbd> help</span>
 	</footer>
@@ -1063,7 +1316,6 @@
 
 {#if drawerView && detailOpen && selected}
 	<Detail
-		bind:this={detail}
 		p={selected}
 		plan={plans[selected.rel]}
 		claude={claude[selected.rel]}
@@ -1225,6 +1477,11 @@
 		color: var(--text);
 		box-shadow: var(--shadow);
 	}
+	.crumb {
+		align-self: center;
+		font-size: 13px;
+		color: var(--muted);
+	}
 	.count.warn {
 		background: var(--accent);
 	}
@@ -1283,6 +1540,14 @@
 	}
 	.muted {
 		color: var(--faint);
+	}
+	.running {
+		font: 11.5px var(--mono);
+		color: var(--running);
+	}
+	.working {
+		font: 11.5px var(--mono);
+		color: var(--accent);
 	}
 	.attn {
 		border: none;
@@ -1383,17 +1648,6 @@
 		flex: 1;
 		overflow-y: auto;
 		padding: 8px 24px 24px;
-	}
-	.plans-main {
-		overflow: hidden;
-		padding: 16px 24px;
-		min-height: 0;
-		flex: 1;
-	}
-	.garage-main {
-		overflow: hidden;
-		padding: 16px 24px;
-		min-height: 0;
 	}
 	section {
 		margin-top: 18px;

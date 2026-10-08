@@ -46,7 +46,22 @@ export type Project = {
 export type Stack = { name: string; dir: string; run?: string; commands?: string[]; source: string };
 
 export type Status = 'idea' | 'active' | 'paused' | 'shipped' | 'dead';
-export type Task = { text: string; done?: boolean };
+export type TaskState = '' | 'doing' | 'done';
+/** id is the number the planboard shows; it is stable, so "#4" keeps its meaning. */
+export type Task = { id?: number; text: string; state?: TaskState };
+
+/** An agent working on one task right now. Keyed "<project rel>#<task id>". */
+export type Claim = {
+	project: string;
+	task: number;
+	text?: string;
+	agent: string;
+	session?: string;
+	branch?: string;
+	claimed_at: string;
+	last_heartbeat: string;
+	stale?: boolean;
+};
 export type PlanLog = { at: string; by?: string; text: string };
 export type Plan = {
 	status?: Status;
@@ -101,6 +116,7 @@ export type Snapshot = {
 	plans_path: string;
 	plans_error?: string;
 	claude: Record<string, ClaudeSummary>;
+	claims: Record<string, Claim>;
 	github: Record<string, GitHubInfo>;
 	github_status?: string;
 };
@@ -191,6 +207,8 @@ export const runState = (r: Run) =>
 
 export const updatePlan = async (project: string, patch: PlanPatch): Promise<Plan> =>
 	(await post('/api/plan', { project, patch })).json();
+
+export const releaseClaim = (project: string, task: number) => post('/api/claims/release', { project, task });
 
 /** Live snapshots over SSE. EventSource reconnects on its own after errors. */
 export function subscribe(

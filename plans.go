@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,20 +39,44 @@ type Plan struct {
 	Tasks    []Task    `yaml:"tasks,omitempty" json:"tasks,omitempty"`
 	Log      []PlanLog `yaml:"log,omitempty" json:"log,omitempty"`
 	Updated  time.Time `yaml:"updated,omitempty" json:"updated,omitzero"`
+	// LastTaskID is the highest task number handed out here. Numbers stay stable
+	// and are not reused while the project has a plan, because you refer to a task
+	// by its number ("do todo #4 of loods") and it must keep meaning that task.
+	LastTaskID int `yaml:"last_task_id,omitempty" json:"last_task_id,omitempty"`
 }
 
-// Task is written as a plain string, "[x] " marks it done, so the file reads
-// like a markdown checklist.
+// Task is written as a plain string: its number, then a markdown-style box.
+// "[x] " marks it done, "[~] " marks it in progress, no box (or "[ ] ") means to
+// do. The three boxes are the three columns of a project's planboard.
+//
+//	- '#8 [~] Shoot new store screenshots'
 type Task struct {
-	Text string `json:"text"`
-	Done bool   `json:"done,omitempty"`
+	ID    int    `json:"id,omitempty"` // stable per project, see Plan.LastTaskID
+	Text  string `json:"text"`
+	State string `json:"state,omitempty"` // "" (to do), "doing", "done"
+}
+
+// TaskStates are the planboard columns, left to right. "" is the first one.
+var TaskStates = []string{"", "doing", "done"}
+
+func (t Task) Done() bool { return t.State == "done" }
+
+func (t Task) box() string {
+	switch t.State {
+	case "done":
+		return "[x] "
+	case "doing":
+		return "[~] "
+	default:
+		return ""
+	}
 }
 
 func (t Task) MarshalYAML() (any, error) {
-	if t.Done {
-		return "[x] " + t.Text, nil
+	if t.ID > 0 {
+		return fmt.Sprintf("#%d %s%s", t.ID, t.box(), t.Text), nil
 	}
-	return t.Text, nil
+	return t.box() + t.Text, nil
 }
 
 func (t *Task) UnmarshalYAML(n *yaml.Node) error {
@@ -59,13 +84,34 @@ func (t *Task) UnmarshalYAML(n *yaml.Node) error {
 	if err := n.Decode(&s); err != nil {
 		return err
 	}
-	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "[ ]"))
-	if rest, ok := strings.CutPrefix(s, "[x]"); ok {
-		*t = Task{Text: strings.TrimSpace(rest), Done: true}
-	} else {
-		*t = Task{Text: s}
-	}
+	*t = parseTask(s)
 	return nil
+}
+
+// parseTask reads one checklist line: an optional "#<n>" number, then an
+// optional box. Unknown boxes are left in the text, so a hand-written line is
+// never silently swallowed; a line without a number gets one on the next write.
+func parseTask(s string) Task {
+	s = strings.TrimSpace(s)
+	var t Task
+	if rest, ok := strings.CutPrefix(s, "#"); ok {
+		digits := rest
+		if i := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' }); i >= 0 {
+			digits = rest[:i]
+		}
+		if n, err := strconv.Atoi(digits); err == nil && n > 0 {
+			t.ID = n
+			s = strings.TrimSpace(rest[len(digits):])
+		}
+	}
+	for _, b := range [][2]string{{"[x]", "done"}, {"[X]", "done"}, {"[~]", "doing"}, {"[ ]", ""}, {"[]", ""}} {
+		if rest, ok := strings.CutPrefix(s, b[0]); ok {
+			t.Text, t.State = strings.TrimSpace(rest), b[1]
+			return t
+		}
+	}
+	t.Text = s
+	return t
 }
 
 type PlanLog struct {
@@ -74,6 +120,9 @@ type PlanLog struct {
 	Text string    `yaml:"text" json:"text"`
 }
 
+// empty reports whether nothing worth storing is left. LastTaskID alone does not
+// count: a plan wiped down to its counter leaves the file, and numbering for that
+// project starts over.
 func (p *Plan) empty() bool {
 	return p.Status == "" && p.Priority == 0 && p.Next == "" && p.Notes == "" && len(p.Tasks) == 0 && len(p.Log) == 0
 }
@@ -96,10 +145,60 @@ func (p *Plan) validate() error {
 	if len(p.Tasks) > maxTasks {
 		return fmt.Errorf("more than %d tasks", maxTasks)
 	}
+	for i := range p.Tasks {
+		p.Tasks[i].Text = strings.TrimSpace(p.Tasks[i].Text)
+		if !slices.Contains(TaskStates, p.Tasks[i].State) {
+			return fmt.Errorf("task state must be empty, doing or done, not %q", p.Tasks[i].State)
+		}
+	}
+	p.numberTasks()
 	if len(p.Log) > maxLog {
 		p.Log = p.Log[len(p.Log)-maxLog:]
 	}
 	return nil
+}
+
+// numberTasks hands a number to every task that has none, and takes a duplicate
+// number (a hand edit, a copied line) away from the later of the two. Numbers
+// only ever go up, so a number you used in a conversation keeps its meaning.
+func (p *Plan) numberTasks() {
+	seen := map[int]bool{}
+	for i, t := range p.Tasks {
+		if t.ID > p.LastTaskID {
+			p.LastTaskID = t.ID
+		}
+		if t.ID > 0 && !seen[t.ID] {
+			seen[t.ID] = true
+			continue
+		}
+		p.LastTaskID++
+		p.Tasks[i].ID = p.LastTaskID
+		seen[p.LastTaskID] = true
+	}
+}
+
+// taskByID finds a task by the number shown on the board.
+func (p *Plan) taskByID(id int) (int, bool) {
+	for i, t := range p.Tasks {
+		if t.ID == id {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// openTasks are the ones still worth picking up, to do first.
+func (p *Plan) openTasks() []Task {
+	var todo, doing []Task
+	for _, t := range p.Tasks {
+		switch t.State {
+		case "":
+			todo = append(todo, t)
+		case "doing":
+			doing = append(doing, t)
+		}
+	}
+	return append(todo, doing...)
 }
 
 func (p *Plan) addLog(by, text string) {
@@ -118,6 +217,7 @@ const plansHeader = `# loods plans: status, priority, next step, notes, tasks an
 # (keys are paths relative to ~/Projects). Written by the board, ` + "`loods plan`" + ` and
 # Claude's /wrapup. Hand edits are picked up within seconds; comments are not kept.
 # status: idea | active | paused | shipped | dead    priority: 1 (high) … 3 (low)
+# tasks: a checklist; "[x] " is done, "[~] " is in progress, no box is to do.
 `
 
 // PlanStore reads plans.yaml and writes it under an exclusive flock, so the

@@ -1,0 +1,403 @@
+<script lang="ts">
+	import { tick } from 'svelte';
+	import type { Claim, Task, TaskState } from './lib/api';
+	import { claimStale, TASK_STATES, taskStateClass, taskStateLabel } from './lib/plan';
+	import { ago } from './lib/time';
+
+	type Props = {
+		tasks: Task[];
+		selected: number; // index into tasks, -1 for none
+		next: string;
+		claims: Record<number, Claim>; // by task number: who is working on it
+		now: number;
+		onselect: (i: number) => void;
+		onmove: (i: number, state: TaskState) => void;
+		onadd: (text: string, state: TaskState) => void;
+		onedit: (i: number, text: string) => void;
+		ondelete: (i: number) => void;
+		onrelease: (i: number) => void;
+	};
+	let { tasks, selected, next, claims, now, onselect, onmove, onadd, onedit, ondelete, onrelease }: Props = $props();
+
+	const claimOf = (t: Task) => (t.id ? claims[t.id] : undefined);
+
+	type Cell = { task: Task; i: number };
+	const columns = $derived(
+		TASK_STATES.map((state) => ({
+			state,
+			cells: tasks.map((task, i) => ({ task, i })).filter((c) => (c.task.state ?? '') === state)
+		}))
+	);
+
+	const hints: Record<string, string> = {
+		'': 'Everything still to pick up. Press a to add one.',
+		doing: 'What you are building right now.',
+		done: 'Finished. Drag back if it reopens.'
+	};
+
+	let dragging = $state<number | null>(null);
+	let over = $state<TaskState | null>(null);
+	let editing = $state<number | null>(null);
+	let draft = $state('');
+	let adding = $state<TaskState | null>(null);
+	let newText = $state('');
+	let addEl = $state<HTMLInputElement>();
+	let editEl = $state<HTMLInputElement>();
+
+	/** a on the planboard: open the add field of a column. */
+	export async function focusAdd(state: TaskState = '') {
+		adding = state;
+		newText = '';
+		await tick();
+		addEl?.focus();
+	}
+
+	/** enter on a card: edit its text in place. */
+	export async function startEdit(i: number) {
+		if (!tasks[i]) return;
+		editing = i;
+		draft = tasks[i].text;
+		await tick();
+		editEl?.focus();
+		editEl?.select();
+	}
+
+	function commitEdit() {
+		const i = editing;
+		editing = null;
+		if (i === null) return;
+		const text = draft.trim();
+		if (text && text !== tasks[i]?.text) onedit(i, text);
+	}
+
+	function commitAdd(keepOpen: boolean) {
+		const text = newText.trim();
+		const state = adding ?? '';
+		newText = '';
+		if (!keepOpen) adding = null;
+		if (text) onadd(text, state);
+	}
+
+	function cardKey(e: KeyboardEvent, c: Cell) {
+		if (e.key !== 'Enter' && e.key !== ' ') return;
+		e.preventDefault();
+		onselect(c.i);
+		if (e.key === 'Enter') startEdit(c.i);
+	}
+</script>
+
+<div class="planboard">
+	{#each columns as col (col.state)}
+		<div
+			class="col {taskStateClass(col.state)}"
+			class:over={over === col.state && dragging !== null}
+			role="listbox"
+			tabindex="-1"
+			aria-label={taskStateLabel(col.state)}
+			ondragover={(e) => {
+				if (dragging === null) return;
+				e.preventDefault();
+				over = col.state;
+			}}
+			ondragleave={(e) => {
+				if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) over = null;
+			}}
+			ondrop={(e) => {
+				e.preventDefault();
+				if (dragging !== null) onmove(dragging, col.state);
+				dragging = over = null;
+			}}
+		>
+			<h2>
+				<span class="dot"></span>{taskStateLabel(col.state)} <span class="n">{col.cells.length}</span>
+				<button class="add" title="Add a task here (a)" onclick={() => focusAdd(col.state)}>+</button>
+			</h2>
+
+			{#if col.state === '' && next}
+				<p class="nextstep" title="the plan's next step (n)">▸ {next}</p>
+			{/if}
+
+			{#each col.cells as c (c.task.id ?? c.task.text + c.i)}
+				{@const claim = claimOf(c.task)}
+				{@const stalled = claim ? claimStale(claim, now) : false}
+				<!-- svelte-ignore a11y_click_events_have_key_events (handled by onkeydown) -->
+				<div
+					class="task"
+					class:claimed={claim && !stalled}
+					class:selected={c.i === selected}
+					class:dragging={dragging === c.i}
+					class:done={col.state === 'done'}
+					data-task={c.i}
+					role="option"
+					aria-selected={c.i === selected}
+					tabindex="-1"
+					draggable={editing !== c.i}
+					ondragstart={(e) => {
+						dragging = c.i;
+						e.dataTransfer?.setData('text/plain', c.task.text);
+						onselect(c.i);
+					}}
+					ondragend={() => (dragging = over = null)}
+					onclick={() => onselect(c.i)}
+					ondblclick={() => startEdit(c.i)}
+					onkeydown={(e) => cardKey(e, c)}
+				>
+					{#if editing === c.i}
+						<input
+							bind:this={editEl}
+							bind:value={draft}
+							class="edit"
+							spellcheck="false"
+							onblur={commitEdit}
+							onkeydown={(e) => {
+								if (e.key === 'Enter') commitEdit();
+								else if (e.key === 'Escape') ((editing = null), (e.target as HTMLElement).blur());
+							}}
+						/>
+					{:else}
+						<span class="text">
+							{#if c.task.id}<span class="num" title="say “do todo #{c.task.id} of this project”">#{c.task.id}</span>{/if}
+							{c.task.text}
+						</span>
+						{#if claim}
+							<div class="agent" class:stalled title={claim.branch ? `on ${claim.branch}, since ${ago(claim.claimed_at, now)} ago` : claim.agent}>
+								<span class="spark">✻</span>
+								{claim.agent}
+								{stalled ? 'stalled' : 'working'}
+								· {ago(claim.last_heartbeat, now)}
+								<button class="drop" title="This agent is gone: free the task (X)" onclick={() => onrelease(c.i)}>free</button>
+							</div>
+						{/if}
+						<div class="row">
+							<button class="step" title="Move left (H)" disabled={col.state === ''} onclick={() => onmove(c.i, TASK_STATES[TASK_STATES.indexOf(col.state) - 1])}>←</button>
+							<button
+								class="step"
+								title="Move right (L)"
+								disabled={col.state === 'done'}
+								onclick={() => onmove(c.i, TASK_STATES[TASK_STATES.indexOf(col.state) + 1])}>→</button
+							>
+							<button class="x" title="Delete task (del)" onclick={() => ondelete(c.i)}>✕</button>
+						</div>
+					{/if}
+				</div>
+			{/each}
+
+			{#if adding === col.state}
+				<input
+					bind:this={addEl}
+					bind:value={newText}
+					class="new"
+					placeholder="Task, enter to save"
+					spellcheck="false"
+					onblur={() => commitAdd(false)}
+					onkeydown={(e) => {
+						if (e.key === 'Enter') commitAdd(true);
+						else if (e.key === 'Escape') ((newText = ''), (adding = null), (e.target as HTMLElement).blur());
+					}}
+				/>
+			{:else if !col.cells.length}
+				<p class="hint">{hints[col.state]}</p>
+			{/if}
+		</div>
+	{/each}
+</div>
+
+<style>
+	.planboard {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(220px, 1fr));
+		gap: 10px;
+		height: 100%;
+		min-height: 0;
+	}
+	.col {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		min-height: 0;
+		overflow-y: auto;
+		padding: 10px;
+		border-radius: 10px;
+		background: color-mix(in srgb, var(--st) 5%, var(--panel));
+		border: 1px solid var(--line);
+		transition: border-color 0.1s;
+	}
+	.col.over {
+		border-color: var(--st);
+		box-shadow: 0 0 0 1px var(--st);
+	}
+	h2 {
+		display: flex;
+		align-items: center;
+		gap: 7px;
+		margin: 2px 2px 4px;
+		font-size: 12px;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		color: var(--muted);
+		font-weight: 600;
+	}
+	.dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--st);
+	}
+	.n {
+		color: var(--faint);
+		font-weight: normal;
+	}
+	.add {
+		margin-left: auto;
+		border: 0;
+		background: none;
+		color: var(--faint);
+		font-size: 15px;
+		line-height: 1;
+		cursor: pointer;
+		padding: 0 3px;
+	}
+	.add:hover {
+		color: var(--accent);
+	}
+	.hint {
+		margin: 4px 2px;
+		font-size: 12px;
+		color: var(--faint);
+	}
+	.nextstep {
+		margin: 0 0 2px;
+		padding: 7px 9px;
+		border-radius: 8px;
+		border: 1px dashed var(--line);
+		background: var(--accent-soft);
+		color: var(--text);
+		font-size: 12.5px;
+		line-height: 1.35;
+	}
+	.task {
+		padding: 8px 10px;
+		border-radius: 8px;
+		background: var(--card);
+		border: 1px solid var(--line);
+		box-shadow: var(--shadow);
+		cursor: grab;
+		scroll-margin: 40px;
+	}
+	.task.claimed {
+		border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+	}
+	.task.selected {
+		border-color: var(--accent);
+		box-shadow:
+			0 0 0 1px var(--accent),
+			var(--shadow);
+	}
+	.task.dragging {
+		opacity: 0.4;
+	}
+	.task.done .text {
+		color: var(--muted);
+		text-decoration: line-through;
+	}
+	.num {
+		font: 600 11px var(--mono);
+		color: var(--faint);
+		margin-right: 3px;
+	}
+	.agent {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		margin-top: 5px;
+		font: 11px var(--mono);
+		color: var(--accent);
+	}
+	.agent .spark {
+		animation: beat 2s ease-in-out infinite;
+	}
+	.agent.stalled {
+		color: var(--faint);
+	}
+	.agent.stalled .spark {
+		animation: none;
+	}
+	@keyframes beat {
+		50% {
+			opacity: 0.35;
+		}
+	}
+	.drop {
+		margin-left: auto;
+		border: 0;
+		background: none;
+		color: inherit;
+		font: inherit;
+		text-decoration: underline;
+		cursor: pointer;
+		opacity: 0;
+		padding: 0;
+	}
+	.task:hover .drop,
+	.task.selected .drop {
+		opacity: 0.75;
+	}
+	.text {
+		display: block;
+		font-size: 13px;
+		line-height: 1.4;
+		overflow-wrap: anywhere;
+	}
+	.row {
+		display: flex;
+		gap: 2px;
+		margin-top: 5px;
+		opacity: 0;
+		transition: opacity 0.1s;
+	}
+	.task:hover .row,
+	.task.selected .row {
+		opacity: 1;
+	}
+	.row button {
+		border: 0;
+		background: none;
+		color: var(--faint);
+		font: 11px var(--mono);
+		cursor: pointer;
+		padding: 1px 4px;
+		border-radius: 4px;
+	}
+	.row button:hover:not(:disabled) {
+		background: var(--chip);
+		color: var(--text);
+	}
+	.row button:disabled {
+		opacity: 0.25;
+		cursor: default;
+	}
+	.row .x {
+		margin-left: auto;
+	}
+	.row .x:hover {
+		color: var(--danger);
+	}
+	input {
+		width: 100%;
+		box-sizing: border-box;
+		font: 13px var(--sans);
+		color: var(--text);
+		background: var(--card);
+		border: 1px solid var(--accent);
+		border-radius: 8px;
+		padding: 8px 9px;
+	}
+	input:focus {
+		outline: none;
+		box-shadow: 0 0 0 1px var(--accent);
+	}
+	.edit {
+		border-radius: 6px;
+		padding: 4px 6px;
+	}
+</style>

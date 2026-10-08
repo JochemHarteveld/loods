@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"maps"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -25,9 +26,10 @@ const planUsage = `usage: loods plan [-p group/project] [command]
   status <status>     idea | active | paused | shipped | dead | none
   priority <0-3>      1 high … 3 low, 0 none
   note <text>         add a log entry
-  task <text>         add a task
-  done <n|text>       tick a task (number from ` + "`loods plan`" + `)
-  undo <n|text>       untick a task
+  task <text>         add a task (to do)
+  doing <n|text>      move a task to in progress (number from ` + "`loods plan`" + `)
+  done <n|text>       tick a task
+  undo <n|text>       move a task back to to do
   drop <n|text>       delete a task
 
 The project is the one containing the current directory, unless -p is given.
@@ -93,7 +95,7 @@ func runPlan(args []string, root, archive string, depth int) error {
 			return err
 		}
 		fn = func(p *Plan) error { p.Tasks = append(p.Tasks, Task{Text: rest}); return nil }
-	case "done", "undo", "drop":
+	case "doing", "done", "undo", "drop":
 		if err := need(); err != nil {
 			return err
 		}
@@ -103,10 +105,12 @@ func runPlan(args []string, root, archive string, depth int) error {
 				return err
 			}
 			switch cmd {
+			case "doing":
+				p.Tasks[i].State = "doing"
 			case "done":
-				p.Tasks[i].Done = true
+				p.Tasks[i].State = "done"
 			case "undo":
-				p.Tasks[i].Done = false
+				p.Tasks[i].State = ""
 			default:
 				p.Tasks = slices.Delete(p.Tasks, i, i+1)
 			}
@@ -123,12 +127,17 @@ func runPlan(args []string, root, archive string, depth int) error {
 	return nil
 }
 
+// findTask takes the stable task number shown by `loods plan` and the board
+// ("#4"), or a piece of the task text. Numbers are not positions: they stay with
+// a task while it moves between columns.
 func findTask(tasks []Task, ref string) (int, error) {
-	if n, err := strconv.Atoi(ref); err == nil {
-		if n < 1 || n > len(tasks) {
-			return 0, fmt.Errorf("no task %d (there are %d)", n, len(tasks))
+	if n, err := strconv.Atoi(strings.TrimPrefix(ref, "#")); err == nil {
+		for i, t := range tasks {
+			if t.ID == n {
+				return i, nil
+			}
 		}
-		return n - 1, nil
+		return 0, fmt.Errorf("no task #%d here (the numbers are the ones `loods plan` prints)", n)
 	}
 	found := -1
 	for i, t := range tasks {
@@ -163,12 +172,9 @@ func printPlan(w io.Writer, rel string, p Plan) {
 	}
 	if len(p.Tasks) > 0 {
 		fmt.Fprintln(w, "tasks:")
-		for i, t := range p.Tasks {
-			box := "[ ]"
-			if t.Done {
-				box = "[x]"
-			}
-			fmt.Fprintf(w, "  %d. %s %s\n", i+1, box, t.Text)
+		for _, t := range p.Tasks {
+			box := map[string]string{"": "[ ]", "doing": "[~]", "done": "[x]"}[t.State]
+			fmt.Fprintf(w, "  #%-3d %s %s\n", t.ID, box, t.Text)
 		}
 	}
 	if p.Notes != "" {
@@ -257,7 +263,30 @@ func runHook(root, archive string, depth int) {
 	printPlan(&b, it.Rel, p)
 	fmt.Print(b.String())
 	fmt.Println()
-	fmt.Println("Keep it current: when the user wraps up, run /wrapup (or `loods plan next|note|task|done`).")
+
+	// Task numbers are stable, so the user can say "do todo #4" and mean it.
+	cs := newClaimStore(claimsPath())
+	cs.Refresh()
+	if open := p.openTasks(); len(open) > 0 {
+		fmt.Printf("Open tasks you can be asked to pick up, by number (%s#<n>):\n", it.Rel)
+		for _, t := range open {
+			line := fmt.Sprintf("  #%-3d %s", t.ID, t.Text)
+			if t.State == "doing" {
+				line += "  (in progress)"
+			}
+			if c, ok := cs.Get(it.Rel, t.ID); ok {
+				state := "working on it"
+				if c.Stale {
+					state = "stalled, no heartbeat"
+				}
+				line += fmt.Sprintf("  ← %s %s", c.Agent, state)
+			}
+			fmt.Println(line)
+		}
+		fmt.Println()
+		fmt.Println("Asked to do one? Claim it first: `loods todo claim " + it.Rel + "#<n>` (see /todo).")
+	}
+	fmt.Println("Keep it current: when the user wraps up, run /wrapup (or `loods plan next|note|task|doing|done`).")
 }
 
 // --- loods claude install / uninstall ---
@@ -279,8 +308,9 @@ user, looking at the board) knows where things stand.
    what is verified, what is not: ` + "`loods plan note \"…\"`" + `
 3. Set the single most useful next step, specific enough to start on without
    rereading this session: ` + "`loods plan next \"…\"`" + `
-4. Tick tasks that are now done (` + "`loods plan done <n>`" + `) and add real,
-   actionable follow-ups (` + "`loods plan task \"…\"`" + `). Skip if there are none.
+4. Move tasks to the column they are in now: ` + "`loods plan done <n>`" + ` for
+   finished ones, ` + "`loods plan doing <n>`" + ` for what is half-built, and add
+   real, actionable follow-ups (` + "`loods plan task \"…\"`" + `). Skip if none.
 5. Change the status only if it clearly changed
    (` + "`loods plan status idea|active|paused|shipped|dead`" + `). Leave priority
    to the user.
@@ -289,6 +319,49 @@ Then tell the user in two or three lines what you recorded.
 
 Extra instructions from the user, if any: $ARGUMENTS
 `
+
+const todoSkill = `---
+name: todo
+description: Pick up, work on and finish numbered tasks from the loods planboard. Use when the user says "do todo #4 of <project>", asks which tasks are open or what to pick up, or hands you work from the board.
+allowed-tools: Bash(loods todo:*), Bash(loods plan:*)
+---
+` + skillMarker + `
+
+Work the user hands you from the loods planboard. Every task has a number that
+stays with it, so "#4 of loods" always means the same task.
+
+1. **Find the work.** ` + "`loods todo list`" + ` for this project,
+   ` + "`loods todo list --all`" + ` for every project (highest priority first,
+   with each project's status and next step). Add ` + "`--json`" + ` when you want
+   to pick from it programmatically. The user often names one outright: "do todo
+   #4 of loods".
+2. **Claim it before you touch anything:** ` + "`loods todo claim <project>#<n>`" + `.
+   That moves the task to in progress and shows on the board that you are on it,
+   so the user can see what is being worked on and does not start it themselves.
+   If another agent is actively on it the claim is refused: say so and stop. Only
+   pass ` + "`--steal`" + ` when the user explicitly tells you to take it over.
+3. **Stay visible.** Run ` + "`loods todo heartbeat <project>#<n>`" + ` as you go:
+   after finishing a step, and before anything long. Without a heartbeat for ten
+   minutes the board marks the task as stalled, which is how the user spots an
+   agent that died.
+4. **Finish it:** ` + "`loods todo done <project>#<n> --note \"what you did\"`" + `.
+   The note lands in the project's log, so write what changed and what is
+   verified, not "done".
+5. **Or hand it back:** ` + "`loods todo release <project>#<n> --note \"why\"`" + `
+   when you stop, get blocked, or the user changes direction. Never walk away from
+   a claim: a task that looks claimed but is not being worked on is worse than an
+   untouched one.
+6. New work you discover while doing this belongs on the board too:
+   ` + "`loods todo add \"…\"`" + ` (it prints the number). Do not quietly widen the
+   task you claimed.
+
+Tell the user which task you claimed, and at the end what you recorded.
+
+Extra instructions from the user, if any: $ARGUMENTS
+`
+
+// skills are everything `loods claude install` writes into ~/.claude/skills.
+var skills = map[string]string{"wrapup": wrapupSkill, "todo": todoSkill}
 
 func claudeDir() string {
 	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
@@ -301,15 +374,18 @@ func claudeDir() string {
 func runClaude(args []string) error {
 	if len(args) != 1 || (args[0] != "install" && args[0] != "uninstall") {
 		return errors.New("usage: loods claude install|uninstall\n\n" +
-			"install adds the /wrapup skill and a SessionStart hook that shows Claude the plan")
+			"install adds the /wrapup and /todo skills and a SessionStart hook that shows Claude the plan")
 	}
-	skill := filepath.Join(claudeDir(), "skills", "wrapup", "SKILL.md")
 	settings := filepath.Join(claudeDir(), "settings.json")
+	names := slices.Sorted(maps.Keys(skills))
 	if args[0] == "uninstall" {
-		if b, err := os.ReadFile(skill); err == nil && bytes.Contains(b, []byte(skillMarker)) {
-			os.Remove(skill)
-			os.Remove(filepath.Dir(skill))
-			fmt.Println("removed", skill)
+		for _, name := range names {
+			skill := skillPath(name)
+			if b, err := os.ReadFile(skill); err == nil && bytes.Contains(b, []byte(skillMarker)) {
+				os.Remove(skill)
+				os.Remove(filepath.Dir(skill))
+				fmt.Println("removed", skill)
+			}
 		}
 		changed, err := editHooks(settings, false)
 		if err == nil && changed {
@@ -318,16 +394,22 @@ func runClaude(args []string) error {
 		return err
 	}
 
-	if b, err := os.ReadFile(skill); err == nil && !bytes.Contains(b, []byte(skillMarker)) {
-		return fmt.Errorf("%s exists and was not written by loods; not touching it", skill)
+	for _, name := range names {
+		skill := skillPath(name)
+		if b, err := os.ReadFile(skill); err == nil && !bytes.Contains(b, []byte(skillMarker)) {
+			return fmt.Errorf("%s exists and was not written by loods; not touching it", skill)
+		}
 	}
-	if err := os.MkdirAll(filepath.Dir(skill), 0o755); err != nil {
-		return err
+	for _, name := range names {
+		skill := skillPath(name)
+		if err := os.MkdirAll(filepath.Dir(skill), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(skill, []byte(skills[name]), 0o644); err != nil {
+			return err
+		}
+		fmt.Println("wrote", skill)
 	}
-	if err := os.WriteFile(skill, []byte(wrapupSkill), 0o644); err != nil {
-		return err
-	}
-	fmt.Println("wrote", skill)
 	changed, err := editHooks(settings, true)
 	if err != nil {
 		return err
@@ -338,6 +420,10 @@ func runClaude(args []string) error {
 		fmt.Println("SessionStart hook already in", settings)
 	}
 	return nil
+}
+
+func skillPath(name string) string {
+	return filepath.Join(claudeDir(), "skills", name, "SKILL.md")
 }
 
 func hookCommand() string {

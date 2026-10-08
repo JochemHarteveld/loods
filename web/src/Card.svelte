@@ -9,13 +9,14 @@
 		claude: ClaudeSummary | undefined;
 		gh: GitHubInfo | undefined;
 		procs: Proc[]; // live processes of this project
+		working: number; // tasks an agent is on right now
 		selected: boolean;
 		now: number;
 		onselect: () => void;
 		ondetail: () => void;
 		onact: (t: Target | 'run') => void;
 	};
-	let { p, plan, claude, gh, procs, selected, now, onselect, ondetail, onact }: Props = $props();
+	let { p, plan, claude, gh, procs, working, selected, now, onselect, ondetail, onact }: Props = $props();
 
 	const fresh = $derived(freshness(p.last_activity, now));
 	const progress = $derived(taskProgress(plan));
@@ -82,6 +83,7 @@
 		{#if p.worktrees}<span class="flag info" title="linked worktrees">⌥ {p.worktrees} wt</span>{/if}
 		{#if gh?.prs.length}<span class="flag info" title={gh.prs.map((pr) => `#${pr.number} ${pr.title}`).join('\n')}>⇄ {gh.prs.length} PR{gh.prs.length === 1 ? '' : 's'}</span>{/if}
 		{#if progress[1]}<span class="flag" class:ok={progress[0] === progress[1]} title="tasks done">☑ {progress[0]}/{progress[1]}</span>{/if}
+		{#if working}<span class="flag agent" title="an agent is working on {working} task{working === 1 ? '' : 's'}">✻ {working} with claude</span>{/if}
 	</div>
 
 	{#if recentClaude}
@@ -350,6 +352,10 @@
 	.flag.info {
 		background: var(--info-soft);
 		color: var(--info);
+	}
+	.flag.agent {
+		background: var(--accent-soft);
+		color: var(--accent);
 	}
 
 	footer {

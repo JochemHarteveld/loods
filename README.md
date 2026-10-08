@@ -1,9 +1,11 @@
 # loods
 
-One board for every project under `~/Projects`: activity, git state, branches,
-shortcuts to open them, a plan per project (status, next step, tasks) with a kanban,
-a Garage that runs their dev servers, and Hygiene / Graveyard views to clean up. Runs as a local
-server with the UI in a chromeless app window.
+One board for every project under `~/Projects`: activity, git state, branches and
+shortcuts to open them. Pick a project and you land on its own page: a planboard of its
+tasks, a garage that runs its dev servers, and its git state. Tasks are numbered, so you
+can tell Claude "do todo #4 of loods" and watch it work on the board. Hygiene and
+Graveyard views clean up across all projects. Runs as a local server with the UI in a
+chromeless app window.
 Absorbs [graveyard](../graveyard) (archive / trash / undo).
 
 ```
@@ -15,35 +17,46 @@ loods --dev         # also accept terminal websockets from the vite dev server (
 loods --json        # one-off scan as JSON (includes sizes), for scripts or Claude
 loods undo          # restore the last archived batch (shares ~/Archive/graveyard.log)
 loods plan          # show / edit the plan of the project you are in (see Plans)
-loods claude install  # /wrapup skill + SessionStart hook for Claude Code
+loods todo          # list, claim and finish numbered tasks, by you or an agent (see Tasks)
+loods claude install  # /wrapup and /todo skills + SessionStart hook for Claude Code
 ```
 
 ## Keys
 
-Everywhere: `1` Board · `2` Plans · `3` Garage · `4` Hygiene · `5` Graveyard · `/` or `ctrl+k` filter ·
-`R` rescan · `?` help · `y`/`n` answer a confirmation
+Everywhere: `/` or `ctrl+k` filter · `R` rescan · `?` help · `y`/`n` answer a confirmation
 
-Board: `hjkl`/arrows move · `enter` details, plan & branches · `c` VS Code · `t` terminal ·
-`o` folder · `g` remote · `r` run · `x` stop · `L` logs · `w` open web URL ·
-`s` sort (activity / priority / name)
+Board, Hygiene, Graveyard: `1` Board · `2` Hygiene · `3` Graveyard
 
-Board and Plans: `n` next step · `a` add task · `N` notes · `m` status · `p` priority
+Board: `hjkl`/arrows move · `enter` open the project page · `space` details drawer ·
+`L` its garage · `c` VS Code · `t` terminal · `o` folder · `g` remote · `r` run · `x` stop ·
+`w` open web URL · `s` sort (activity / priority / name)
 
-Plans: `hjkl` move · `H`/`L` move the card a column left / right (or drag it)
+Project page: `esc` back to the board · `1` Planboard · `2` Garage · `3` Git
+
+Board and project page: `n` next step · `N` notes · `a` add task · `m` status · `p` priority ·
+`c`/`t`/`o`/`g` open · `r` run · `x` stop · `w` web URL
+
+Planboard: `hjkl` move · `H`/`L` move the task a column left / right (or drag it) ·
+`space` done ⇄ to do · `enter` rename · `del` delete · `X` free a task from an agent
+
+Garage: `j`/`k` select · `i`/`enter` type into the terminal (`esc` leaves) · `r` restart ·
+`x` stop (again: kill) · `u`/`U` flutter hot reload / restart · `w` open URL · `del` remove
 
 Hygiene: `j`/`k` select · `enter` fix (asks first) · `space` details
 
 Graveyard: `space` mark · `a` archive · `x` trash · `u` undo the last archive · `d` duplicates only ·
 `s` sort by age / size / name · `R` measure again
 
-Garage: `j`/`k` select · `i`/`enter` type into the terminal (`esc` leaves) · `r` restart ·
-`x` stop (again: kill) · `u`/`U` flutter hot reload / restart · `w` open URL · `del` remove
-
 ## Plans
 
 Every project gets a status (`idea` · `active` · `paused` · `shipped` · `dead`; none = inbox),
-a priority (P1–P3), a next step, tasks, notes and a short log. The Plans tab is a kanban by
-status; cards on the Board show the status, priority, next step and task progress.
+a priority (P1–P3), a next step, tasks, notes and a short log. Cards on the Board show the
+status, priority, next step and task progress; the project page's **Planboard** tab is a kanban
+of that project's tasks in three columns — to do, in progress, done — with the next step pinned
+above the first column.
+
+Every task carries a number (`#8`) that stays with it while it moves, is never reused, and
+is what you point at from a conversation. `last_task_id` is the counter behind it.
 
 They live in `~/.config/loods/plans.yaml`, separate from the hand-written config because
 loods writes this one. Edits from the board, the CLI, Claude or your editor all go through
@@ -55,9 +68,11 @@ projects:
     status: active
     priority: 1
     next: Fix Play Store rejection: privacy policy URL
+    last_task_id: 3
     tasks:
-      - Update privacy policy page
-      - '[x] Resubmit build'
+      - '#1 Update privacy policy page'
+      - '#2 [~] Shoot new store screenshots'
+      - '#3 [x] Resubmit build'
 ```
 
 ```
@@ -65,7 +80,8 @@ loods plan                       # show the plan of the project containing $PWD
 loods plan next "…"              # set the next step
 loods plan status paused         # idea | active | paused | shipped | dead | none
 loods plan priority 1            # 0 = none
-loods plan task "…"              # add a task;  done / undo / drop <n|text>
+loods plan task "…"              # add a task (to do)
+loods plan doing 2               # move task #2 to in progress; done / undo / drop <n|text>
 loods plan note "…"              # add a log entry
 loods plan -p group/project …    # another project
 ```
@@ -78,12 +94,58 @@ loods plan -p group/project …    # another project
   folder that has since moved are matched by folder name; sessions in a workspace folder
   above several repos are not attributed.
 - **`loods claude install`** adds two things to `~/.claude` (undo with `loods claude uninstall`):
-  - a `/wrapup` skill: Claude logs what the session did, sets the next step and ticks or adds
+  - a `/wrapup` skill: Claude logs what the session did, sets the next step and moves or adds
     tasks via `loods plan`;
+  - a `/todo` skill: Claude picks up a numbered task, claims it, works, and reports back
+    (see [Tasks and agents](#tasks-and-agents));
   - a `SessionStart` hook (`loods hook`): a new session in a project starts with its plan in
     context, so Claude knows where you left off.
 
   `settings.json` keeps its other keys and order; a backup is written next to it.
+
+## Tasks and agents
+
+Handing work to Claude is the same loop you would do by hand, with the board as the shared
+state. Numbers are the handle: "do todo #4 of loods" is unambiguous because `#4` never
+moves to another task.
+
+```
+loods todo                                 # open tasks of the project you are in
+loods todo list --all                      # every project, highest priority first
+loods todo list --all --json               # the same, for an agent to read
+loods todo show loods#4                    # one task with its project's plan
+loods todo claim loods#4                   # take it: in progress, and marked as yours
+loods todo heartbeat loods#4               # still working on it
+loods todo done loods#4 --note "…"         # finished; the note goes in the project log
+loods todo release loods#4 --note "…"      # handed back: back to to do, claim dropped
+loods todo add "…"                         # new task, prints its number
+```
+
+A ref is `group/project#4`, `#4` or `4`; a bare number means the project you are in (or
+`-p group/project`). `--state todo|doing|done|any` widens the default (everything not done),
+`--mine` narrows it to this agent.
+
+**Claims** say who is working on what. They live in `~/.local/state/loods/claims.json`, not
+in `plans.yaml`: a plan is durable, a claim is not. Each claim carries the agent, its session
+id, the branch, and a heartbeat. The planboard shows a claimed task with `✻ claude working ·
+2m`; after ten minutes without a heartbeat it reads `stalled`, which is how you spot an agent
+that died. `X` (or *free* on the card) drops the claim — it asks first, and warns you when the
+agent is in fact still reporting in. Claiming a task another agent is actively on is refused
+unless you pass `--steal`; a stale claim can be taken over without asking. A project that
+leaves the board takes its claims with it.
+
+Two agents can work two tasks of one project at once: claims are per task, and every write
+goes through the same file lock as the board.
+
+### Claude
+
+`loods claude install` adds a `/todo` skill that tells Claude the whole loop: list, claim
+before starting, heartbeat while working, finish with a note or hand it back. The SessionStart
+hook prints the project's open tasks with their numbers and any claim, so a fresh session
+already knows what `#4` means.
+
+No MCP server is needed for Claude Code: it runs `loods todo` over Bash. An MCP server would
+only add a transport for clients that cannot run commands (Claude Desktop, claude.ai).
 
 ## Hygiene
 
@@ -121,7 +183,9 @@ old graveyard tool. Projects with a running process are refused.
 
 ## Garage
 
-Commands are detected per project root and its direct subfolders (`app/`, `web/`, …):
+Every project page has a garage: the commands loods found for that project, its running
+processes with their terminals, and the stacks of its group. Commands are detected per project
+root and its direct subfolders (`app/`, `web/`, …):
 
 | Found | Command |
 |---|---|
@@ -172,7 +236,8 @@ stacks:
 ## How it works
 
 - Rescans every 30 s (or `R`) and pushes a snapshot over SSE; the UI only re-renders when something changed.
-  Plan edits and new Claude transcript lines are picked up between scans.
+  Plan edits, task claims and new Claude transcript lines are picked up between scans, so a
+  `loods todo claim` in a terminal shows up on the board within two seconds.
 - Board scans skip `node_modules`, `build`, … entirely, so a full scan takes about a second.
 - Ahead/behind counts come from the last `git fetch`; loods never fetches. The only network use is
   the read-only `gh` queries above.
@@ -196,4 +261,5 @@ make test
 2. ~~Garage: detected dev commands, process manager with terminals, ports, RAM, stacks~~
 3. ~~Plans: status / next step / priority / tasks, kanban, Claude sessions, /wrapup + SessionStart hook~~
 4. ~~Hygiene: branch & worktree cleanup with undo, `gh` PRs and CI, warnings, graveyard view~~
-5. Extras: activity feed, ask-Claude, weekly digest, adb / serial devices
+5. ~~Project pages: per-project planboard, garage and git; numbered tasks an agent can claim~~
+6. Extras: activity feed, MCP server for clients without a shell, weekly digest, adb / serial devices

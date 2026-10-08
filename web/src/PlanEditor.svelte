@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { fetchSessions, type ClaudeSession, type ClaudeSummary, type Plan, type PlanPatch, type Status, type Task } from './lib/api';
-	import { STATUSES, statusClass, statusLabel } from './lib/plan';
+	import { fetchSessions, type ClaudeSession, type ClaudeSummary, type Plan, type PlanPatch, type Status } from './lib/api';
+	import { STATUSES, statusClass, statusLabel, taskProgress } from './lib/plan';
 	import { ago } from './lib/time';
 
 	type Props = {
@@ -13,16 +13,13 @@
 	let { rel, plan, claude, now, onsave }: Props = $props();
 
 	let nextEl = $state<HTMLInputElement>();
-	let taskEl = $state<HTMLInputElement>();
 	let notesEl = $state<HTMLTextAreaElement>();
 	export const focusNext = () => (nextEl?.focus(), nextEl?.select());
-	export const focusTask = () => taskEl?.focus();
 	export const focusNotes = () => notesEl?.focus();
 
 	// Drafts follow the saved plan unless the field is being edited.
 	let next = $state('');
 	let notes = $state('');
-	let newTask = $state('');
 	$effect(() => {
 		const v = plan?.next ?? '';
 		if (document.activeElement !== nextEl) next = v;
@@ -31,13 +28,7 @@
 		const v = plan?.notes ?? '';
 		if (document.activeElement !== notesEl) notes = v;
 	});
-	// Another project: drop half-typed text.
-	$effect(() => {
-		void rel;
-		newTask = '';
-	});
-
-	const tasks = $derived(plan?.tasks ?? []);
+	const progress = $derived(taskProgress(plan));
 	const log = $derived([...(plan?.log ?? [])].reverse().slice(0, 8));
 
 	let sessions = $state<ClaudeSession[]>([]);
@@ -57,17 +48,6 @@
 	function saveNotes() {
 		if (notes !== (plan?.notes ?? '')) onsave({ notes });
 	}
-	const setTasks = (t: Task[]) => onsave({ tasks: t });
-	function addTask() {
-		const text = newTask.trim();
-		if (!text) return;
-		newTask = '';
-		setTasks([...tasks, { text }]);
-	}
-	const toggle = (i: number) => setTasks(tasks.map((t, j) => (j === i ? { ...t, done: !t.done } : t)));
-	const remove = (i: number) => setTasks(tasks.filter((_, j) => j !== i));
-	const clearDone = () => setTasks(tasks.filter((t) => !t.done));
-
 	function onFieldKey(e: KeyboardEvent, revert: () => void, save: () => void) {
 		if (e.key === 'Escape') {
 			revert();
@@ -116,35 +96,9 @@
 		/>
 	</label>
 
-	<div class="field">
-		<span>
-			Tasks <kbd>a</kbd>
-			{#if tasks.some((t) => t.done)}<button class="link" onclick={clearDone}>clear done</button>{/if}
-		</span>
-		{#if tasks.length}
-			<ul class="tasks">
-				{#each tasks as t, i (i + t.text)}
-					<li class:done={t.done}>
-						<label>
-							<input type="checkbox" checked={t.done} onchange={() => toggle(i)} />
-							<span>{t.text}</span>
-						</label>
-						<button class="x" title="Delete task" onclick={() => remove(i)}>✕</button>
-					</li>
-				{/each}
-			</ul>
-		{/if}
-		<input
-			bind:this={taskEl}
-			bind:value={newTask}
-			placeholder="Add a task, enter to save"
-			spellcheck="false"
-			onkeydown={(e) => {
-				if (e.key === 'Enter') addTask();
-				else if (e.key === 'Escape') ((newTask = ''), (e.target as HTMLElement).blur());
-			}}
-		/>
-	</div>
+	{#if progress[1]}
+		<p class="progress" class:ok={progress[0] === progress[1]}>☑ {progress[0]} of {progress[1]} tasks done — the planboard has them</p>
+	{/if}
 
 	<label class="field">
 		<span>Notes <kbd>N</kbd></span>
@@ -305,42 +259,13 @@
 		flex-direction: column;
 		gap: 2px;
 	}
-	.tasks li {
-		display: flex;
-		align-items: flex-start;
-		gap: 6px;
-		font-size: 13.5px;
+	.progress {
+		margin: 0;
+		font: 11.5px var(--mono);
+		color: var(--muted);
 	}
-	.tasks label {
-		flex: 1;
-		display: flex;
-		align-items: flex-start;
-		gap: 8px;
-		cursor: pointer;
-		min-width: 0;
-		padding: 2px 0;
-	}
-	.tasks input {
-		margin-top: 3px;
-		accent-color: var(--running);
-	}
-	.tasks span {
-		overflow-wrap: anywhere;
-	}
-	.tasks li.done span {
-		color: var(--faint);
-		text-decoration: line-through;
-	}
-	.x {
-		border: none;
-		background: none;
-		color: var(--faint);
-		cursor: pointer;
-		opacity: 0;
-		font-size: 12px;
-	}
-	.tasks li:hover .x {
-		opacity: 1;
+	.progress.ok {
+		color: var(--hot);
 	}
 	.log li {
 		display: flex;

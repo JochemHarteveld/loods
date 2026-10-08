@@ -32,6 +32,7 @@ type Server struct {
 
 	procs  *Manager
 	plans  *PlanStore
+	claims *ClaimStore
 	claude *claudeIndex
 	gh     *githubPoller
 	gitlog *gitLog
@@ -66,6 +67,8 @@ type Snapshot struct {
 	PlansPath  string                   `json:"plans_path"`
 	PlansError string                   `json:"plans_error,omitempty"`
 	Claude     map[string]ClaudeSummary `json:"claude"`
+	// Claims are keyed "<project rel>#<task number>": which agent is on which task.
+	Claims map[string]Claim `json:"claims"`
 	// GitHub is keyed by project rel; GitHubStatus says why it is empty.
 	GitHub       map[string]GitHubInfo `json:"github"`
 	GitHubStatus string                `json:"github_status,omitempty"`
@@ -82,6 +85,7 @@ func newServer(root, archive string, depth, port int, stateFile string) *Server 
 		root: root, archive: archive, depth: depth, port: port,
 		cfgPath: configPath(),
 		plans:   newPlanStore(plansPath()),
+		claims:  newClaimStore(claimsPath()),
 		claude:  newClaudeIndex(claudeProjectsDir()),
 		subs:    map[*sub]struct{}{},
 		trigger: make(chan struct{}, 1),
@@ -89,6 +93,7 @@ func newServer(root, archive string, depth, port int, stateFile string) *Server 
 		gh:      newGitHubPoller(),
 	}
 	s.plans.Refresh()
+	s.claims.Refresh()
 	s.procs = newManager(stateFile, s.publishProcs)
 	s.gitlog = &gitLog{path: gitLogPath(filepath.Dir(stateFile))}
 	return s
@@ -117,8 +122,9 @@ func (s *Server) statsLoop(every time.Duration) {
 		s.publishProcs()
 		tick++
 		plans := s.plans.Refresh()
+		claims := s.claims.Refresh()
 		claude := tick%5 == 0 && s.claude.Refresh()
-		if plans || claude {
+		if plans || claims || claude {
 			s.publish(false)
 		}
 	}
@@ -180,6 +186,12 @@ func (s *Server) rescan() {
 	s.items, s.stacks, s.cfgErr = board, stacks, cfgErr
 	s.githubOff = cfg.GitHub != nil && !*cfg.GitHub
 	s.mu.Unlock()
+	// A renamed or archived project should not keep a task claimed forever.
+	rels := make([]string, 0, len(board))
+	for _, it := range board {
+		rels = append(rels, it.Rel)
+	}
+	s.claims.ReleaseGone(rels)
 	s.publish(false)
 	if first {
 		notify(s.ghKick)
@@ -189,13 +201,14 @@ func (s *Server) rescan() {
 // publish rebuilds the snapshot and wakes subscribers if anything changed.
 func (s *Server) publish(scanning bool) {
 	plans, plansErr := s.plans.All()
+	claims := s.claims.All()
 	github, ghStatus := s.gh.snapshot()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	snap := Snapshot{
 		Root: s.root, ScannedAt: time.Now(), Scanning: scanning, ConfigPath: s.cfgPath, ConfigError: s.cfgErr,
 		Projects: s.items, Stacks: s.stacks,
-		Plans: plans, PlansPath: s.plans.path, Claude: map[string]ClaudeSummary{},
+		Plans: plans, PlansPath: s.plans.path, Claude: map[string]ClaudeSummary{}, Claims: claims,
 		GitHub: github, GitHubStatus: ghStatus,
 	}
 	if s.githubOff {
@@ -285,6 +298,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("POST /api/procs/{action}", s.procAction)
 	mux.HandleFunc("GET /api/procs/term", s.term)
 	mux.HandleFunc("POST /api/plan", s.updatePlan)
+	mux.HandleFunc("POST /api/claims/release", s.releaseClaim)
 	mux.HandleFunc("GET /api/graveyard", s.graveyard)
 	mux.HandleFunc("POST /api/graveyard/undo", s.unbury)
 	mux.HandleFunc("POST /api/graveyard/{action}", s.bury)
@@ -550,6 +564,30 @@ func (s *Server) updatePlan(w http.ResponseWriter, r *http.Request) {
 	}
 	s.publish(false)
 	writeJSON(w, p)
+}
+
+// releaseClaim drops an agent's claim from the board, for when a session died and
+// left a task looking like someone is on it.
+func (s *Server) releaseClaim(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Project string `json:"project"`
+		Task    int    `json:"task"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if s.find(req.Project) == nil {
+		http.Error(w, "unknown project", http.StatusNotFound)
+		return
+	}
+	c, had, err := s.claims.Release(req.Project, req.Task)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.publish(false)
+	writeJSON(w, map[string]any{"released": had, "claim": c})
 }
 
 // term streams a process terminal over a websocket: binary frames out

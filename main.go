@@ -28,7 +28,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, `usage:
   loods [flags] [root]      serve the board for projects under root (default ~/Projects, or $LOODS_ROOT)
   loods plan [command]      show or edit the plan of the project you are in (loods plan -h)
-  loods claude install      add the /wrapup skill and a SessionStart hook to Claude Code
+  loods todo [command]      list, claim and finish numbered tasks, for you or an agent (loods todo -h)
+  loods claude install      add the /wrapup and /todo skills and a SessionStart hook to Claude Code
   loods claude uninstall    remove them again
   loods hook                the SessionStart hook itself (reads Claude's JSON on stdin)
   loods undo                restore the last archived batch
@@ -52,6 +53,11 @@ flags:
 		return
 	case "plan":
 		if err := runPlan(flag.Args()[1:], root, archiveRoot, *depth); err != nil {
+			fail(err)
+		}
+		return
+	case "todo":
+		if err := runTodo(flag.Args()[1:], root, archiveRoot, *depth); err != nil {
 			fail(err)
 		}
 		return
@@ -125,14 +131,18 @@ flags:
 	srv.Close()
 }
 
-func stateFile() string {
+// stateDir holds what loods remembers between runs but you never edit:
+// surviving processes, the branch-cleanup log, task claims.
+func stateDir() string {
 	dir := os.Getenv("XDG_STATE_HOME")
 	if dir == "" {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, ".local", "state")
 	}
-	return filepath.Join(dir, "loods", "procs.json")
+	return filepath.Join(dir, "loods")
 }
+
+func stateFile() string { return filepath.Join(stateDir(), "procs.json") }
 
 func alreadyRunning(url string) bool {
 	c := http.Client{Timeout: 500 * time.Millisecond}

@@ -29,12 +29,14 @@
 		onfix: (f: Finding) => void;
 		ondelete: (branches: Branch[], data: BranchList) => void;
 		onundo: () => void;
+		// Inline mode is the project page's Git tab: no drawer chrome, and no plan
+		// editor, because the Plan tab already has one.
+		inline?: boolean;
 	};
-	let { p, plan, claude, now, onclose, onact, onsave, gh, findings, version, onfix, ondelete, onundo }: Props = $props();
+	let { p, plan, claude, now, onclose, onact, onsave, gh, findings, version, onfix, ondelete, onundo, inline = false }: Props = $props();
 
 	let editor = $state<ReturnType<typeof PlanEditor>>();
 	export const focusNext = () => editor?.focusNext();
-	export const focusTask = () => editor?.focusTask();
 	export const focusNotes = () => editor?.focusNotes();
 
 	const id = $derived(p.rel);
@@ -67,14 +69,16 @@
 	const ciState = $derived(gh?.ci ? runState(gh.ci) : null);
 </script>
 
-<aside>
-	<header>
-		<div>
-			<div class="group">{p.group || 'projects'}</div>
-			<h2>{p.name}</h2>
-		</div>
-		<button class="close" onclick={onclose} title="Close (esc)">✕</button>
-	</header>
+<aside class:inline>
+	{#if !inline}
+		<header>
+			<div>
+				<div class="group">{p.group || 'projects'}</div>
+				<h2>{p.name}</h2>
+			</div>
+			<button class="close" onclick={onclose} title="Close (esc)">✕</button>
+		</header>
+	{/if}
 
 	<dl>
 		<dt>path</dt>
@@ -106,12 +110,14 @@
 		{/if}
 	</dl>
 
-	<div class="buttons">
-		<button onclick={() => onact('code')}><kbd>c</kbd> VS Code</button>
-		<button onclick={() => onact('terminal')}><kbd>t</kbd> Terminal</button>
-		<button onclick={() => onact('folder')}><kbd>o</kbd> Folder</button>
-		{#if p.web_url}<button onclick={() => onact('github')}><kbd>g</kbd> Remote</button>{/if}
-	</div>
+	{#if !inline}
+		<div class="buttons">
+			<button onclick={() => onact('code')}><kbd>c</kbd> VS Code</button>
+			<button onclick={() => onact('terminal')}><kbd>t</kbd> Terminal</button>
+			<button onclick={() => onact('folder')}><kbd>o</kbd> Folder</button>
+			{#if p.web_url}<button onclick={() => onact('github')}><kbd>g</kbd> Remote</button>{/if}
+		</div>
+	{/if}
 
 	{#if findings.length}
 		<ul class="findings">
@@ -127,7 +133,9 @@
 		</ul>
 	{/if}
 
-	<PlanEditor bind:this={editor} rel={p.rel} {plan} {claude} {now} {onsave} />
+	{#if !inline}
+		<PlanEditor bind:this={editor} rel={p.rel} {plan} {claude} {now} {onsave} />
+	{/if}
 
 	{#if gh?.prs.length}
 		<h3>Pull requests <span class="muted">{gh.prs.length} open</span></h3>
@@ -221,6 +229,16 @@
 		padding: 18px 20px;
 		overflow-y: auto;
 		z-index: 10;
+	}
+	aside.inline {
+		position: static;
+		width: auto;
+		max-width: 760px;
+		border-left: 0;
+		box-shadow: none;
+		background: none;
+		padding: 0;
+		height: 100%;
 	}
 	header {
 		display: flex;

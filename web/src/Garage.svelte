@@ -6,17 +6,19 @@
 	export type ProcAction = 'stop' | 'restart' | 'remove' | 'reload' | 'hot-restart';
 
 	type Props = {
-		procs: Proc[];
-		stacks: Stack[];
+		procs: Proc[]; // already scoped to the project by the caller
+		stacks: Stack[]; // stacks of the project's group
 		projects: Project[];
+		project: Project; // the project this control panel runs
 		selectedId: string | null;
 		now: number;
 		configPath: string;
 		onselect: (id: string) => void;
 		onaction: (a: ProcAction, p: Proc) => void;
 		onstack: (s: Stack) => void;
+		oncommand: (name: string) => void;
 	};
-	let { procs, stacks, projects, selectedId, now, configPath, onselect, onaction, onstack }: Props = $props();
+	let { procs, stacks, projects, project, selectedId, now, configPath, onselect, onaction, onstack, oncommand }: Props = $props();
 
 	let terminal = $state<ReturnType<typeof Terminal>>();
 	export function focusTerminal() {
@@ -24,6 +26,8 @@
 	}
 
 	const selected = $derived(procs.find((p) => p.id === selectedId) ?? null);
+	const commands = $derived(project.commands ?? []);
+	const procFor = (command: string) => procs.find((p) => p.id === `${project.rel}#${command}`);
 	const projectName = (rel?: string) => (rel ? (projects.find((p) => p.rel === rel)?.name ?? rel) : '');
 	const stackProc = (s: Stack) => procs.find((p) => p.id === 'stack:' + s.name);
 
@@ -44,9 +48,33 @@
 
 <div class="garage">
 	<aside class="list">
+		<h2>Commands <span>{commands.length}</span></h2>
+		{#if !commands.length}
+			<p class="empty">No commands found for {project.name}. Add one under <code>commands:</code> in<br /><code>{configPath}</code></p>
+		{/if}
+		<ul>
+			{#each commands as c (c.name)}
+				{@const cp = procFor(c.name)}
+				<li class="cmd">
+					<div class="body">
+						<span class="title">
+							<b>{c.name}</b>
+							{#if c.name === project.default_command}<em>default</em>{/if}
+						</span>
+						<span class="sub mono" title={c.dir ?? project.path}>{c.run}</span>
+					</div>
+					{#if cp && isAlive(cp)}
+						<button class="small" onclick={() => onselect(cp.id)}>view</button>
+					{:else}
+						<button class="small go" onclick={() => oncommand(c.name)}>▶ start</button>
+					{/if}
+				</li>
+			{/each}
+		</ul>
+
 		<h2>Processes <span>{procs.filter(isAlive).length} running</span></h2>
 		{#if !procs.length}
-			<p class="empty">Nothing running. Pick a project on the Board and press <kbd>r</kbd>.</p>
+			<p class="empty">Nothing started yet. Press <kbd>r</kbd> or start a command above.</p>
 		{/if}
 		<ul>
 			{#each procs as p (p.id)}
@@ -55,7 +83,7 @@
 						<span class="dot {p.status}" class:failed={failed(p)}></span>
 						<span class="body">
 							<span class="title">
-								{#if p.project}<b>{projectName(p.project)}</b> · {p.name}{:else}<b>{p.name}</b> <em>stack</em>{/if}
+								{#if p.project}<b>{p.name}</b>{:else}<b>{p.name}</b> <em>stack</em>{/if}
 							</span>
 							<span class="sub">{statusText(p)}</span>
 							{#if isAlive(p) && (p.rss_bytes || p.ports?.length || p.warning)}
@@ -71,9 +99,8 @@
 			{/each}
 		</ul>
 
-		<h2>Stacks</h2>
-		{#if !stacks.length}
-			<p class="empty">No stacks. Add one under <code>stacks:</code> in<br /><code>{configPath}</code></p>
+		{#if stacks.length}
+			<h2>Stacks <span>{project.group || 'group'}</span></h2>
 		{/if}
 		<ul>
 			{#each stacks as s (s.name)}
@@ -134,7 +161,7 @@
 			</div>
 		{:else}
 			<div class="placeholder">
-				<p>Select a process to see its terminal.</p>
+				<p>Start a command above, or select a process to see its terminal.</p>
 				<p class="hint"><kbd>j</kbd>/<kbd>k</kbd> select · <kbd>i</kbd> type into terminal · <kbd>esc</kbd> leave it</p>
 			</div>
 		{/if}
@@ -281,6 +308,7 @@
 			box-shadow: 0 0 0 5px color-mix(in srgb, var(--running) 8%, transparent);
 		}
 	}
+	.cmd,
 	.stack {
 		display: flex;
 		align-items: center;
@@ -288,6 +316,14 @@
 		padding: 9px 12px;
 		border: 1px dashed var(--line);
 		border-radius: 8px;
+	}
+	.cmd {
+		border-style: solid;
+		background: var(--card);
+	}
+	.cmd .body,
+	.stack .body {
+		min-width: 0;
 	}
 	.small {
 		flex: none;
@@ -321,10 +357,12 @@
 		padding: 10px 14px;
 		background: var(--panel);
 		border-bottom: 1px solid var(--line);
-		flex-wrap: wrap;
 	}
+	/* The info side only gets the space the buttons leave, so its ticking status
+	   text can't change the header's height and resize (redraw) the terminal. */
 	.info {
-		min-width: 0;
+		flex: 1 1 0;
+		min-width: 120px;
 		display: flex;
 		flex-direction: column;
 		gap: 3px;
@@ -355,6 +393,8 @@
 		display: flex;
 		gap: 6px;
 		flex-wrap: wrap;
+		justify-content: flex-end;
+		min-width: 0;
 	}
 	.btn {
 		display: inline-flex;

@@ -143,3 +143,14 @@ button {
 .st-none {
 	--st: var(--faint);
 }
+
+/* Planboard task columns: components use var(--st) the same way. */
+.ts-todo {
+	--st: var(--cold);
+}
+.ts-doing {
+	--st: var(--accent);
+}
+.ts-done {
+	--st: var(--hot);
+}
