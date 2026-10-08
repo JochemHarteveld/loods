@@ -360,8 +360,97 @@ Tell the user which task you claimed, and at the end what you recorded.
 Extra instructions from the user, if any: $ARGUMENTS
 `
 
+const orchestrateSkill = `---
+name: orchestrate
+description: Plan a goal as a graph of jobs and let loods run them as parallel agents. Use when the user asks for a whole project or feature to be built by several agents at once, when loods started you as the orchestrator of a run, or when they say "orchestrate", "spin up agents" or "maak hier een project van".
+allowed-tools: Bash(loods run:*), Bash(loods new:*), Bash(loods plan:*), Bash(loods todo:*)
+---
+` + skillMarker + `
+
+You split a goal into jobs, hand the graph to loods, and watch. loods starts
+each job as its own Claude session in a terminal on the board, so the user sees
+which agents are running and what each of them is doing.
+
+**You do not do the jobs yourself**, and you do not decide what runs at the same
+time: loods starts a job as soon as everything it ` + "`needs`" + ` is done, at most
+--max-parallel sessions at once, and never two jobs that hold the same
+` + "`exclusive`" + ` lock.
+
+1. **Know what you are orchestrating.** ` + "`loods run list`" + ` for this project;
+   loods names your run in the prompt it started you with. No project yet?
+   ` + "`loods new <name> \"<what to build>\"`" + ` creates one and starts an
+   orchestrator in it (that may be you, in the new project).
+2. **Write the graph.** One job per piece of work, each with an ` + "`id`" + `, a
+   ` + "`title`" + ` and a ` + "`prompt`" + ` that is enough on its own: the agent
+   reading it has the project in front of it but not your reasoning. Add
+   ` + "`needs: [other ids]`" + ` only for real dependencies — anything you leave
+   out runs in parallel, which is the point. Add ` + "`exclusive: repo`" + ` to
+   every job that commits, because two sessions in one working tree fight over
+   the index. Add ` + "`task: <n>`" + ` when the job is a numbered task from the
+   planboard, so the card shows it as live work.
+3. **Submit it:** ` + "`loods run submit <run> --file -`" + ` with the YAML on
+   stdin. The graph is checked as a whole: a cycle, a missing ` + "`needs`" + ` or
+   a job without a prompt is refused and nothing is started, so fix it and
+   submit again.
+4. **Watch:** ` + "`loods run status <run> --watch`" + ` prints the run whenever
+   something moves and returns when it is over. Jobs report themselves; you only
+   step in when one fails.
+5. **React.** A failed job blocks everything that needed it. Decide: add a
+   repaired job with ` + "`loods run extend <run> --file -`" + ` (it may depend on
+   jobs that are already done), do the small fix yourself, or tell the user it
+   is blocked and why. Use ` + "`extend`" + ` for work you only discover once a
+   job reports back — that is the part of the plan you were not able to write up
+   front.
+6. **Close it.** When the run is over: ` + "`loods plan next \"…\"`" + ` and
+   ` + "`loods plan note \"…\"`" + `, then tell the user in a few lines what was
+   built, what failed, and what you left on the board.
+
+A graph for a new project looks like this. It is a starting point, not a script:
+rewrite the prompts for the actual goal, drop what does not apply, add what does.
+
+` + "```yaml" + `
+jobs:
+  - id: repo
+    role: git
+    title: Create the repository and push it to GitHub
+    exclusive: repo
+    prompt: |
+      Make this folder a git repository with a .gitignore and a README that
+      names the project and its stack, commit it, then create a private GitHub
+      repository with gh and push. Report the repository URL.
+  - id: stories
+    role: stories
+    title: Write the user stories
+    prompt: |
+      Write docs/userstories.md: the user roles, and per role the user stories
+      that cover the goal, each with acceptance criteria. Keep them small
+      enough to become one ticket each.
+  - id: tickets
+    role: tickets
+    needs: [stories]
+    title: Turn the user stories into tasks on the planboard
+    prompt: |
+      Read docs/userstories.md and add one task per story with
+      'loods todo add "…"'. Report the numbers you added.
+  - id: scaffold
+    role: scaffold
+    needs: [repo]
+    exclusive: repo
+    title: Scaffold the application
+    prompt: |
+      Set up the project skeleton for the stack in the goal, with a working dev
+      command and a README that says how to run it. Commit and push.
+` + "```" + `
+
+Here repo and stories have nothing to do with each other and run together,
+tickets comes out of the stories, and scaffold waits for repo because both
+commit.
+
+Extra instructions from the user, if any: $ARGUMENTS
+`
+
 // skills are everything `loods claude install` writes into ~/.claude/skills.
-var skills = map[string]string{"wrapup": wrapupSkill, "todo": todoSkill}
+var skills = map[string]string{"wrapup": wrapupSkill, "todo": todoSkill, "orchestrate": orchestrateSkill}
 
 func claudeDir() string {
 	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
@@ -374,7 +463,7 @@ func claudeDir() string {
 func runClaude(args []string) error {
 	if len(args) != 1 || (args[0] != "install" && args[0] != "uninstall") {
 		return errors.New("usage: loods claude install|uninstall\n\n" +
-			"install adds the /wrapup and /todo skills and a SessionStart hook that shows Claude the plan")
+			"install adds the /wrapup, /todo and /orchestrate skills and a SessionStart hook that shows Claude the plan")
 	}
 	settings := filepath.Join(claudeDir(), "settings.json")
 	names := slices.Sorted(maps.Keys(skills))

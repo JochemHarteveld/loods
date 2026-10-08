@@ -44,6 +44,7 @@
 		selectedProcId: string | null;
 		taskSel: number;
 		claims: Record<number, Claim>; // by task number, this project only
+		agents: Record<number, Proc>; // by task number: agent terminals of this project
 		now: number;
 		configPath: string;
 		ontab: (t: Tab) => void;
@@ -56,6 +57,8 @@
 		ontasks: (tasks: Task[], note?: string) => void;
 		ontaskselect: (i: number) => void;
 		onrelease: (i: number) => void;
+		onassign: (i: number) => void;
+		onterminal: (i: number) => void;
 		onprocselect: (id: string) => void;
 		onprocaction: (a: ProcAction, proc: Proc) => void;
 		onstack: (s: Stack) => void;
@@ -77,6 +80,7 @@
 		selectedProcId,
 		taskSel,
 		claims,
+		agents,
 		now,
 		configPath,
 		ontab,
@@ -89,6 +93,8 @@
 		ontasks,
 		ontaskselect,
 		onrelease,
+		onassign,
+		onterminal,
 		onprocselect,
 		onprocaction,
 		onstack,
@@ -107,6 +113,8 @@
 	export const addTask = async (state: TaskState = '') => (await tick(), board?.focusAdd(state));
 	export const editTask = async (i: number) => (await tick(), board?.startEdit(i));
 	export const focusTerminal = async () => (await tick(), garage?.focusTerminal());
+	/** esc on the planboard: close an open task menu instead of leaving the page. */
+	export const closeTaskMenu = () => board?.closeMenu() ?? false;
 
 	const tasks = $derived(plan?.tasks ?? []);
 	const working = $derived(Object.values(claims).filter((c) => !claimStale(c, now)).length);
@@ -173,9 +181,12 @@
 					selected={taskSel}
 					next={plan?.next ?? ''}
 					{claims}
+					{agents}
 					{now}
 					onselect={ontaskselect}
 					{onrelease}
+					{onassign}
+					{onterminal}
 					onmove={moveTaskTo}
 					onadd={addNew}
 					onedit={editText}

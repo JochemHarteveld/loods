@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { tick } from 'svelte';
-	import type { Claim, Task, TaskState } from './lib/api';
+	import { isAlive, type Claim, type Proc, type Task, type TaskState } from './lib/api';
 	import { claimStale, TASK_STATES, taskStateClass, taskStateLabel } from './lib/plan';
 	import { ago } from './lib/time';
 
@@ -9,6 +9,7 @@
 		selected: number; // index into tasks, -1 for none
 		next: string;
 		claims: Record<number, Claim>; // by task number: who is working on it
+		agents: Record<number, Proc>; // by task number: the agent terminal loods started for it
 		now: number;
 		onselect: (i: number) => void;
 		onmove: (i: number, state: TaskState) => void;
@@ -16,10 +17,13 @@
 		onedit: (i: number, text: string) => void;
 		ondelete: (i: number) => void;
 		onrelease: (i: number) => void;
+		onassign: (i: number) => void; // hand the task to a Claude agent
+		onterminal: (i: number) => void; // show the terminal of the agent on it
 	};
-	let { tasks, selected, next, claims, now, onselect, onmove, onadd, onedit, ondelete, onrelease }: Props = $props();
+	let { tasks, selected, next, claims, agents, now, onselect, onmove, onadd, onedit, ondelete, onrelease, onassign, onterminal }: Props = $props();
 
 	const claimOf = (t: Task) => (t.id ? claims[t.id] : undefined);
+	const agentOf = (t: Task) => (t.id ? agents[t.id] : undefined);
 
 	type Cell = { task: Task; i: number };
 	const columns = $derived(
@@ -84,7 +88,44 @@
 		onselect(c.i);
 		if (e.key === 'Enter') startEdit(c.i);
 	}
+
+	// Clicking a card opens its menu: what you can do with this task, with
+	// handing it to an agent first. Keys do the same things, so the menu is the
+	// discoverable half, not the only way.
+	let menu = $state<{ i: number; x: number; y: number } | null>(null);
+	const MENU_H = 250;
+
+	function openMenu(e: MouseEvent, c: Cell) {
+		onselect(c.i);
+		if (menu?.i === c.i) return (menu = null); // clicking the same card again closes it
+		const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		menu = {
+			i: c.i,
+			x: Math.min(r.left, window.innerWidth - 230),
+			y: r.bottom + MENU_H > window.innerHeight ? Math.max(8, r.top - MENU_H) : r.bottom + 4
+		};
+	}
+
+	/** esc on the planboard closes the menu before it leaves the page. */
+	export function closeMenu() {
+		if (!menu) return false;
+		menu = null;
+		return true;
+	}
+
+	function pick(fn: (i: number) => void) {
+		const i = menu?.i;
+		menu = null;
+		if (i !== undefined) fn(i);
+	}
 </script>
+
+<svelte:window
+	onpointerdown={(e) => {
+		const t = e.target as HTMLElement;
+		if (menu && !t.closest('.taskmenu') && !t.closest('.task')) menu = null;
+	}}
+/>
 
 <div class="planboard">
 	{#each columns as col (col.state)}
@@ -119,6 +160,7 @@
 
 			{#each col.cells as c (c.task.id ?? c.task.text + c.i)}
 				{@const claim = claimOf(c.task)}
+				{@const agent = agentOf(c.task)}
 				{@const stalled = claim ? claimStale(claim, now) : false}
 				<!-- svelte-ignore a11y_click_events_have_key_events (handled by onkeydown) -->
 				<div
@@ -138,8 +180,8 @@
 						onselect(c.i);
 					}}
 					ondragend={() => (dragging = over = null)}
-					onclick={() => onselect(c.i)}
-					ondblclick={() => startEdit(c.i)}
+					onclick={(e) => openMenu(e, c)}
+					ondblclick={() => ((menu = null), startEdit(c.i))}
 					onkeydown={(e) => cardKey(e, c)}
 				>
 					{#if editing === c.i}
@@ -165,18 +207,33 @@
 								{claim.agent}
 								{stalled ? 'stalled' : 'working'}
 								· {ago(claim.last_heartbeat, now)}
-								<button class="drop" title="This agent is gone: free the task (X)" onclick={() => onrelease(c.i)}>free</button>
+								{#if agent}
+									<button class="term" title="Show its terminal in the agent dock" onclick={(e) => (e.stopPropagation(), onterminal(c.i))}>terminal</button>
+								{/if}
+								<button class="drop" title="This agent is gone: free the task (X)" onclick={(e) => (e.stopPropagation(), onrelease(c.i))}>free</button>
+							</div>
+						{:else if agent}
+							<!-- An agent of ours is up but has not claimed the task yet (or stopped without finishing). -->
+							<div class="agent" class:stalled={!isAlive(agent)} title={agent.run}>
+								<span class="spark">✻</span>
+								{isAlive(agent) ? 'agent starting' : agent.stopped ? 'agent stopped' : 'agent gone'}
+								<button class="term" title="Show its terminal in the agent dock" onclick={(e) => (e.stopPropagation(), onterminal(c.i))}>terminal</button>
 							</div>
 						{/if}
 						<div class="row">
-							<button class="step" title="Move left (H)" disabled={col.state === ''} onclick={() => onmove(c.i, TASK_STATES[TASK_STATES.indexOf(col.state) - 1])}>←</button>
+							<button
+								class="step"
+								title="Move left (H)"
+								disabled={col.state === ''}
+								onclick={(e) => (e.stopPropagation(), (menu = null), onmove(c.i, TASK_STATES[TASK_STATES.indexOf(col.state) - 1]))}>←</button
+							>
 							<button
 								class="step"
 								title="Move right (L)"
 								disabled={col.state === 'done'}
-								onclick={() => onmove(c.i, TASK_STATES[TASK_STATES.indexOf(col.state) + 1])}>→</button
+								onclick={(e) => (e.stopPropagation(), (menu = null), onmove(c.i, TASK_STATES[TASK_STATES.indexOf(col.state) + 1]))}>→</button
 							>
-							<button class="x" title="Delete task (del)" onclick={() => ondelete(c.i)}>✕</button>
+							<button class="x" title="Delete task (del)" onclick={(e) => (e.stopPropagation(), (menu = null), ondelete(c.i))}>✕</button>
 						</div>
 					{/if}
 				</div>
@@ -201,6 +258,30 @@
 		</div>
 	{/each}
 </div>
+
+{#if menu && tasks[menu.i]}
+	{@const t = tasks[menu.i]}
+	{@const claim = claimOf(t)}
+	{@const agent = agentOf(t)}
+	<div class="taskmenu" style:left="{menu.x}px" style:top="{menu.y}px">
+		<p class="head">{#if t.id}<span class="num">#{t.id}</span>{/if}{t.text}</p>
+		{#if agent && isAlive(agent)}
+			<button onclick={() => pick(onterminal)}><span class="ico">✻</span> Show agent terminal</button>
+		{:else if t.id}
+			<button class="assign" onclick={() => pick(onassign)}>
+				<span class="ico">✻</span> Assign to agent <kbd>A</kbd>
+			</button>
+		{/if}
+		{#each TASK_STATES.filter((st) => st !== (t.state ?? '')) as st (st)}
+			<button onclick={() => pick((i) => onmove(i, st))}><span class="ico">→</span> Move to {taskStateLabel(st).toLowerCase()}</button>
+		{/each}
+		<button onclick={() => pick(startEdit)}><span class="ico">✎</span> Rename <kbd>enter</kbd></button>
+		{#if claim}
+			<button onclick={() => pick(onrelease)}><span class="ico">⦸</span> Free from {claim.agent} <kbd>X</kbd></button>
+		{/if}
+		<button class="danger" onclick={() => pick(ondelete)}><span class="ico">✕</span> Delete</button>
+	</div>
+{/if}
 
 <style>
 	.planboard {
@@ -326,6 +407,77 @@
 		50% {
 			opacity: 0.35;
 		}
+	}
+	.taskmenu {
+		position: fixed;
+		z-index: 20;
+		width: 230px;
+		padding: 5px;
+		border-radius: 9px;
+		border: 1px solid var(--line);
+		background: var(--panel);
+		box-shadow: 0 10px 28px rgb(0 0 0 / 0.3);
+	}
+	.taskmenu .head {
+		margin: 2px 6px 5px;
+		font-size: 11.5px;
+		line-height: 1.35;
+		color: var(--muted);
+		display: -webkit-box;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
+	}
+	.taskmenu button {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		width: 100%;
+		border: 0;
+		border-radius: 6px;
+		background: none;
+		color: var(--text);
+		font: 12.5px var(--sans);
+		text-align: left;
+		padding: 6px 7px;
+		cursor: pointer;
+	}
+	.taskmenu button:hover {
+		background: var(--chip);
+	}
+	.taskmenu button.assign:hover {
+		background: var(--accent-soft);
+	}
+	.taskmenu button.danger:hover {
+		color: var(--danger);
+	}
+	.taskmenu .ico {
+		width: 13px;
+		color: var(--faint);
+		font-size: 12px;
+		text-align: center;
+	}
+	.taskmenu button.assign .ico {
+		color: var(--accent);
+	}
+	.taskmenu kbd {
+		margin-left: auto;
+		font: 10.5px var(--mono);
+		color: var(--faint);
+		border: 1px solid var(--line);
+		border-radius: 4px;
+		padding: 0 3px;
+	}
+	.term {
+		border: 0;
+		background: none;
+		color: inherit;
+		font: inherit;
+		text-decoration: underline;
+		cursor: pointer;
+		padding: 0;
+		opacity: 0.75;
 	}
 	.drop {
 		margin-left: auto;

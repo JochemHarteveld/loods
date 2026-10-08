@@ -27,9 +27,12 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `usage:
   loods [flags] [root]      serve the board for projects under root (default ~/Projects, or $LOODS_ROOT)
+  loods new <name> "<what to build>"
+                            create a project and hand the goal to an orchestrator agent (loods new -h)
+  loods run [command]       the runs of a project: submit a graph of jobs, follow it, report back (loods run -h)
   loods plan [command]      show or edit the plan of the project you are in (loods plan -h)
   loods todo [command]      list, claim and finish numbered tasks, for you or an agent (loods todo -h)
-  loods claude install      add the /wrapup and /todo skills and a SessionStart hook to Claude Code
+  loods claude install      add the /wrapup, /todo and /orchestrate skills and a SessionStart hook
   loods claude uninstall    remove them again
   loods hook                the SessionStart hook itself (reads Claude's JSON on stdin)
   loods undo                restore the last archived batch
@@ -48,6 +51,16 @@ flags:
 	switch flag.Arg(0) {
 	case "undo":
 		if err := runUndo(*archive); err != nil {
+			fail(err)
+		}
+		return
+	case "new":
+		if err := runNew(flag.Args()[1:], root, *port); err != nil {
+			fail(err)
+		}
+		return
+	case "run":
+		if err := runRun(flag.Args()[1:], root, archiveRoot, *depth, *port); err != nil {
 			fail(err)
 		}
 		return

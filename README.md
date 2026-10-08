@@ -3,7 +3,9 @@
 One board for every project under `~/Projects`: activity, git state, branches and
 shortcuts to open them. Pick a project and you land on its own page: a planboard of its
 tasks, a garage that runs its dev servers, and its git state. Tasks are numbered, so you
-can tell Claude "do todo #4 of loods" and watch it work on the board. Hygiene and
+can tell Claude "do todo #4 of loods" and watch it work on the board. A whole project can be
+handed to agents at once: one orchestrator plans the work, loods runs the jobs it hands out —
+several at a time — and the Agents view shows what every session is doing. Hygiene and
 Graveyard views clean up across all projects. Runs as a local server with the UI in a
 chromeless app window.
 Absorbs [graveyard](../graveyard) (archive / trash / undo).
@@ -15,17 +17,20 @@ loods               # again while running: just opens another window
 loods --no-open     # server only
 loods --dev         # also accept terminal websockets from the vite dev server (:5173)
 loods --json        # one-off scan as JSON (includes sizes), for scripts or Claude
+loods new <name> "<what to build>"   # new project, planned and built by agents (see Runs)
+loods run           # the runs of a project: submit a graph of jobs, follow it, report back
 loods undo          # restore the last archived batch (shares ~/Archive/graveyard.log)
 loods plan          # show / edit the plan of the project you are in (see Plans)
 loods todo          # list, claim and finish numbered tasks, by you or an agent (see Tasks)
-loods claude install  # /wrapup and /todo skills + SessionStart hook for Claude Code
+loods claude install  # /wrapup, /todo and /orchestrate skills + SessionStart hook for Claude Code
 ```
 
 ## Keys
 
 Everywhere: `/` or `ctrl+k` filter · `R` rescan · `?` help · `y`/`n` answer a confirmation
 
-Board, Hygiene, Graveyard: `1` Board · `2` Hygiene · `3` Graveyard
+Board, Hygiene, Graveyard, Agents: `1` Board · `2` Hygiene · `3` Graveyard · `4` Agents ·
+`+` new project (planned and built by agents)
 
 Board: `hjkl`/arrows move · `enter` open the project page · `space` details drawer ·
 `L` its garage · `c` VS Code · `t` terminal · `o` folder · `g` remote · `r` run · `x` stop ·
@@ -37,7 +42,12 @@ Board and project page: `n` next step · `N` notes · `a` add task · `m` status
 `c`/`t`/`o`/`g` open · `r` run · `x` stop · `w` web URL
 
 Planboard: `hjkl` move · `H`/`L` move the task a column left / right (or drag it) ·
-`space` done ⇄ to do · `enter` rename · `del` delete · `X` free a task from an agent
+`space` done ⇄ to do · `enter` rename · `del` delete · click a task for its menu ·
+`A` assign it to an agent · `i` type into that agent's terminal · `X` free a task from an agent
+
+Agents: click a session to show its terminal in the dock · `+` new project
+
+Anywhere: `` ` `` show / hide the agent dock
 
 Garage: `j`/`k` select · `i`/`enter` type into the terminal (`esc` leaves) · `r` restart ·
 `x` stop (again: kill) · `u`/`U` flutter hot reload / restart · `w` open URL · `del` remove
@@ -93,11 +103,13 @@ loods plan -p group/project …    # another project
   title); the details drawer lists recent sessions with prompts and active time. Sessions in a
   folder that has since moved are matched by folder name; sessions in a workspace folder
   above several repos are not attributed.
-- **`loods claude install`** adds two things to `~/.claude` (undo with `loods claude uninstall`):
+- **`loods claude install`** adds four things to `~/.claude` (undo with `loods claude uninstall`):
   - a `/wrapup` skill: Claude logs what the session did, sets the next step and moves or adds
     tasks via `loods plan`;
   - a `/todo` skill: Claude picks up a numbered task, claims it, works, and reports back
     (see [Tasks and agents](#tasks-and-agents));
+  - an `/orchestrate` skill: Claude splits a goal into a graph of jobs and lets loods run them
+    as parallel agents (see [Runs](#runs-a-whole-project-by-several-agents));
   - a `SessionStart` hook (`loods hook`): a new session in a project starts with its plan in
     context, so Claude knows where you left off.
 
@@ -137,6 +149,23 @@ leaves the board takes its claims with it.
 Two agents can work two tasks of one project at once: claims are per task, and every write
 goes through the same file lock as the board.
 
+### Handing a task over from the board
+
+Clicking a task on the planboard opens its menu: **assign to agent** (`A`), move it to another
+column, rename, delete, and free it from an agent. Assigning starts a Claude Code session in a
+real terminal in the project itself — `claude "Pick up todo loods#4 …"`, with the loop of the
+`/todo` skill spelled out in the prompt — and moves the task to in progress with a line in the
+project log. loods does not claim the task for the agent: a claim is the session's own statement,
+so the card reads `✻ agent starting` until the agent claims it, and `✻ claude working · 2m` after.
+
+Those terminals live in the **agent dock** along the bottom of the window, with one tab per
+agent, so they keep running (and stay one click away) while you walk the board. `` ` `` shows and
+hides it, a tab switches to that agent, `i` types into the selected one and `esc` leaves it, and
+the dock's *task* button jumps to the planboard of the task an agent is on. Several agents run at
+once — one per task, over any number of projects. An agent is an ordinary loods process, so it
+has the same output backlog, stop (Ctrl+C, then SIGTERM, then SIGKILL) and *run again* as a dev
+server, and quitting loods stops them with everything else.
+
 ### Claude
 
 `loods claude install` adds a `/todo` skill that tells Claude the whole loop: list, claim
@@ -146,6 +175,91 @@ already knows what `#4` means.
 
 No MCP server is needed for Claude Code: it runs `loods todo` over Bash. An MCP server would
 only add a transport for clients that cannot run commands (Claude Desktop, claude.ai).
+
+## Runs: a whole project by several agents
+
+One task is one agent. A **run** is one goal split into **jobs**, each with its own agent, and
+loods decides what may run at the same time. `loods new` is the short way in:
+
+```
+loods new huizenzoeker "a house-hunting site with svelte and express"
+loods new -g blauweschuit barsys2 "…"      # in a group folder
+loods new --no-agent …                     # only the project and its plan
+```
+
+The folder, a git repository and a plan exist within a second, so the project is on the board
+before anything is built. Then loods starts an **orchestrator**: a Claude session in that
+project whose job is to plan, not to build. It writes a graph of jobs and hands it to loods:
+
+```yaml
+jobs:
+  - id: repo
+    role: git
+    title: Create the repository and push it to GitHub
+    exclusive: repo
+    prompt: |
+      .gitignore, a README, commit, then `gh repo create --private` and push.
+  - id: stories
+    role: stories
+    title: Write the user stories
+    prompt: |
+      Write docs/userstories.md …
+  - id: tickets
+    role: tickets
+    needs: [stories]
+    task: 2
+    title: Turn the user stories into tasks on the planboard
+    prompt: |
+      One `loods todo add` per story …
+```
+
+loods starts a job as soon as everything it `needs` is done, at most `--max-parallel` sessions
+at a time (3), and never two jobs holding the same `exclusive` lock — `repo` for anything that
+commits, because two sessions in one working tree race over the index. Locks are per project,
+so two runs on one repo take turns while runs on different projects never wait for each other.
+Here `repo` and `stories` start together, `tickets` follows `stories`, and a job with
+`task: 2` claims that planboard task so the card shows it as live work.
+
+Each job is an ordinary loods process, so it has the same terminal, output backlog and stop as
+a dev server, and it reports back itself:
+
+```
+loods run done <run>:<job> --note "what you did"
+loods run fail <run>:<job> --note "why"
+```
+
+Nothing that depends on a job starts until it reports. A job whose session ends without
+reporting is a failure — the run has no way to know what it built — and everything that needed
+it reads `blocked` instead of waiting forever. The orchestrator decides what to do with that:
+repair it with `loods run extend`, fix it itself, or tell you it is stuck. `extend` is also how
+it adds work it only discovers once a job reports back; a graph with a cycle, a missing `needs`
+or a job without a prompt is refused as a whole, so nothing starts half-planned.
+
+The **Agents** view (`4`) is one card per run: the orchestrator on top, then the jobs in waves —
+everything in one column may run at the same time, and each column waits for the one before it.
+Every job line says what it is doing, or why it is not: `waits for stories`,
+`waits for a free repo (repo has it)`, or the note its agent left. Clicking a line brings that
+session's terminal up in the dock, where the tabs of a run sit together with the orchestrator
+first. *cancel run* stops handing out work and stops the sessions it started.
+
+```
+loods run                          # the runs of this project (--all for every project)
+loods run new "<goal>"             # a run with no jobs yet; prints its id
+loods run submit <run> --file -    # give it its graph (YAML on stdin or a file)
+loods run extend <run> --file -    # add jobs to a run that is already going
+loods run status <run> --watch     # print it whenever something moves
+loods run done|fail <run>:<job> --note "…"
+loods run cancel <run>
+```
+
+Runs live in `~/.local/state/loods/runs.json`, next to procs.json and claims.json: a plan is
+durable, a run is as alive as the sessions in it. Finished runs stay a week as history. The CLI
+only writes state — the server starts the sessions, so without a running loods the commands say
+so instead of silently doing nothing. A job that was running when loods died is failed on the
+next start, so a run never waits for a session that is gone.
+
+`loods claude install` adds an `/orchestrate` skill that spells this loop out, and the sessions
+loods starts carry it in their prompt, so they report back with or without the skill installed.
 
 ## Hygiene
 
@@ -235,6 +349,8 @@ stacks:
 
 ## How it works
 
+- Runs are scheduled in the same two-second pass that picks up plan edits: read what the agents
+  wrote, turn ended sessions into finished jobs, then start whatever may run now.
 - Rescans every 30 s (or `R`) and pushes a snapshot over SSE; the UI only re-renders when something changed.
   Plan edits, task claims and new Claude transcript lines are picked up between scans, so a
   `loods todo claim` in a terminal shows up on the board within two seconds.
@@ -262,4 +378,6 @@ make test
 3. ~~Plans: status / next step / priority / tasks, kanban, Claude sessions, /wrapup + SessionStart hook~~
 4. ~~Hygiene: branch & worktree cleanup with undo, `gh` PRs and CI, warnings, graveyard view~~
 5. ~~Project pages: per-project planboard, garage and git; numbered tasks an agent can claim~~
-6. Extras: activity feed, MCP server for clients without a shell, weekly digest, adb / serial devices
+6. ~~Runs: `loods new`, an orchestrator that plans a graph of jobs, a scheduler that runs them
+   in parallel, and the Agents view~~
+7. Extras: activity feed, MCP server for clients without a shell, weekly digest, adb / serial devices

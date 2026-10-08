@@ -100,11 +100,10 @@ func runTodo(args []string, root, archive string, depth int) error {
 		f.session = cmp(os.Getenv("LOODS_AGENT_SESSION"), os.Getenv("CLAUDE_SESSION_ID"))
 	}
 
-	cmd := "list"
+	cmd, rest := "list", words
 	if len(words) > 0 {
-		cmd = words[0]
+		cmd, rest = words[0], words[1:]
 	}
-	rest := words[1:]
 	ps := newPlanStore(plansPath())
 	ps.Refresh()
 	cs := newClaimStore(claimsPath())

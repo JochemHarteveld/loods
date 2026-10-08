@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import AgentDock from './AgentDock.svelte';
+	import Agents from './Agents.svelte';
 	import Card from './Card.svelte';
 	import Detail from './Detail.svelte';
 	import { type ProcAction } from './Garage.svelte';
@@ -12,12 +14,18 @@
 		fetchGraveyard,
 		gitOp,
 		unbury,
+		isAgent,
 		isAlive,
+		runOver,
+		type AgentRun,
 		openIn,
 		procAction,
 		releaseClaim,
 		rescan,
+		startAgent,
 		startCommand,
+		startProject,
+		cancelRun,
 		startStack,
 		subscribe,
 		updatePlan,
@@ -45,8 +53,8 @@
 	type Group = { name: string; items: Project[]; latest: number };
 	// Top-level views. Everything about one project — its planboard, its garage
 	// and its git state — lives on that project's own page.
-	type View = 'board' | 'hygiene' | 'graveyard' | 'project';
-	const VIEWS: View[] = ['board', 'hygiene', 'graveyard'];
+	type View = 'board' | 'hygiene' | 'graveyard' | 'agents' | 'project';
+	const VIEWS: View[] = ['board', 'hygiene', 'graveyard', 'agents'];
 	type Route = { view: View; rel?: string; tab?: Tab };
 
 	// Routes: '', '#hygiene', '#graveyard', '#p/<rel>' and '#p/<rel>!<tab>'.
@@ -79,6 +87,7 @@
 	let plans = $state<Record<string, Plan>>({});
 	let claude = $state<Record<string, ClaudeSummary>>({});
 	let claims = $state<Record<string, Claim>>({});
+	let runs = $state<Record<string, AgentRun>>({});
 	let github = $state<Record<string, GitHubInfo>>({});
 	let githubStatus = $state('');
 	let hyIndex = $state(0);
@@ -111,6 +120,18 @@
 	let sortBy = $state<'activity' | 'priority' | 'name'>('activity');
 	let selectedId = $state<string | null>(null);
 	let selectedProcId = $state<string | null>(null);
+	// The agent dock: terminals of the Claude sessions loods started, at the
+	// bottom of the window whatever view you are in, because an agent keeps
+	// working while you walk the board.
+	let agentId = $state<string | null>(null);
+	let dockOpen = $state(false);
+	let dockHeight = $state(300);
+	// The row picked in the Agents view, as "<run>:<job>" ("<run>:" is its
+	// orchestrator), so the selection survives a snapshot.
+	let selectedJob = $state<string | null>(null);
+	// The + dialog: a name, what to build, and optionally a group folder.
+	let newProj = $state<{ name: string; goal: string; group: string } | null>(null);
+	let newBusy = $state(false);
 	let detailOpen = $state(false);
 	let helpOpen = $state(false);
 	let picker = $state<{ project: Project; index: number } | null>(null);
@@ -181,7 +202,21 @@
 	const live = $derived(procs.filter(isAlive));
 	const liveRSS = $derived(live.reduce((sum, p) => sum + (p.rss_bytes ?? 0), 0));
 	const memUsed = $derived(mem.total ? 1 - mem.available / mem.total : 0);
-	const procsOf = (rel: string) => live.filter((p) => p.project === rel);
+	const procsOf = (rel: string) => live.filter((p) => p.project === rel && !isAgent(p));
+	// Agents are processes too, but they belong in the dock, not in a garage.
+	const agentProcs = $derived(procs.filter(isAgent));
+	// Runs, newest first: the Agents view walks them in this order.
+	const runList = $derived(
+		Object.values(runs).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || a.id.localeCompare(b.id))
+	);
+	const liveRuns = $derived(runList.filter((r) => !runOver(r)));
+	/** Live sessions per project, for the card badge: agents plus a run's jobs. */
+	const sessionsPer = $derived.by(() => {
+		const per: Record<string, number> = {};
+		for (const p of agentProcs) if (isAlive(p) && p.project) per[p.project] = (per[p.project] ?? 0) + 1;
+		return per;
+	});
+	const selectedAgent = $derived(agentProcs.find((p) => p.id === agentId) ?? agentProcs[agentProcs.length - 1] ?? null);
 	// space opens the details drawer for a quick peek without leaving the list.
 	const drawerView = $derived(view === 'board' || view === 'hygiene');
 
@@ -191,7 +226,7 @@
 	const projectProcs = $derived.by(() => {
 		if (!project) return [];
 		const stackIds = new Set(groupStacks.map((s) => 'stack:' + s.name));
-		return procs.filter((pr) => pr.project === project.rel || stackIds.has(pr.id));
+		return procs.filter((pr) => (pr.project === project.rel && !isAgent(pr)) || stackIds.has(pr.id));
 	});
 	// Garage keys act on a process of the open project, never on someone else's.
 	const selectedProc = $derived(projectProcs.find((p) => p.id === selectedProcId) ?? null);
@@ -202,6 +237,13 @@
 		const out: Record<number, Claim> = {};
 		if (!project) return out;
 		for (const c of Object.values(claims)) if (c.project === project.rel) out[c.task] = c;
+		return out;
+	});
+	// Agent terminals of the open project, by task number, for the planboard.
+	const projectAgents = $derived.by(() => {
+		const out: Record<number, Proc> = {};
+		if (!project) return out;
+		for (const pr of agentProcs) if (pr.project === project.rel && pr.task) out[pr.task] = pr;
 		return out;
 	});
 	// How many tasks an agent is on, per project, for the board cards.
@@ -241,6 +283,13 @@
 		}
 	});
 
+	// Keep the dock on an agent that still exists, and close it when the last one
+	// is removed, so an empty dock never sits there taking up room.
+	$effect(() => {
+		if (agentProcs.length && !agentProcs.some((p) => p.id === agentId)) agentId = agentProcs[agentProcs.length - 1].id;
+		if (!agentProcs.length && dockOpen) dockOpen = false;
+	});
+
 	// Keep valid selections when filter or data change.
 	$effect(() => {
 		if (!selected && order.length) selectedId = order[0].rel;
@@ -267,6 +316,7 @@
 				plans = s.plans ?? {};
 				claude = s.claude ?? {};
 				claims = s.claims ?? {};
+				runs = s.runs ?? {};
 				github = s.github ?? {};
 				githubStatus = s.github_status ?? '';
 				plansPath = s.plans_path;
@@ -539,6 +589,102 @@
 			case 'remove':
 				return attempt(() => procAction('remove', p.id));
 		}
+	}
+
+	// --- agents ---
+
+	let dock = $state<ReturnType<typeof AgentDock>>();
+
+	/** Hand a task to a Claude agent and bring up its terminal in the dock. */
+	async function assignAgent(p: Project | null, t: Task | undefined) {
+		if (!p || !t) return;
+		if (!t.id) return flash('This task has no number yet; it gets one on the next save', true);
+		const id = `${p.rel}#agent:${t.id}`;
+		const running = agentProcs.find((pr) => pr.id === id && isAlive(pr));
+		if (running) {
+			showAgent(id);
+			return flash(`An agent is already on ${p.name}#${t.id}`);
+		}
+		try {
+			await startAgent(p.rel, t.id);
+			showAgent(id);
+			flash(`✻ agent on ${p.name}#${t.id}`);
+		} catch (e) {
+			flash((e as Error).message, true);
+		}
+	}
+
+	function showAgent(id: string) {
+		agentId = id;
+		dockOpen = true;
+	}
+
+	/** Type into the agent terminal, like i does in a garage. */
+	async function focusDock() {
+		if (!agentProcs.length) return flash('No agent terminals yet: press A on a task to hand it to one');
+		dockOpen = true;
+		await tick();
+		dock?.focus();
+	}
+
+	function toggleDock() {
+		if (!agentProcs.length) return flash('No agent terminals yet: press A on a task to hand it to one');
+		dockOpen = !dockOpen;
+	}
+
+	/** The dock's "task" button: open the planboard of the task this agent is on. */
+	function gotoAgentTask(pr: Proc) {
+		if (pr.project && pr.task) gotoTask(pr.project, pr.task);
+	}
+
+	/** Open the planboard of a task, from the dock or the Agents view. */
+	function gotoTask(rel: string, task: number) {
+		openProject(rel, 'plan');
+		const i = (plans[rel]?.tasks ?? []).findIndex((t) => t.id === task);
+		if (i >= 0) taskSel = i;
+	}
+
+	/** + : a new project an orchestrator plans and builds. */
+	function openNewProject() {
+		newProj = { name: '', goal: '', group: '' };
+	}
+
+	async function createProject() {
+		if (!newProj || newBusy) return;
+		const { name, goal, group } = newProj;
+		if (!name.trim() || !goal.trim()) return flash('A new project needs a name and what to build', true);
+		newBusy = true;
+		try {
+			const run = await startProject(name.trim(), goal.trim(), group.trim() || undefined);
+			newProj = null;
+			selectedJob = `${run.id}:`;
+			view = 'agents';
+			if (run.orchestrator) showAgent(run.orchestrator);
+			flash(`✻ ${run.project}: an orchestrator is planning the work`);
+		} catch (e) {
+			flash((e as Error).message, true);
+		} finally {
+			newBusy = false;
+		}
+	}
+
+	// Cancelling asks first: it stops every session the run started, and an
+	// agent halfway through a commit is worth a confirmation.
+	function askCancelRun(r: AgentRun) {
+		const busy = (r.jobs ?? []).filter((j) => j.status === 'running');
+		confirm = {
+			title: `Cancel run ${r.id} of ${r.project}`,
+			lines: [
+				{ text: r.goal, sub: `${(r.jobs ?? []).length} jobs, ${busy.length} working` },
+				...busy.map((j) => ({ text: j.role || j.id, sub: 'its session is stopped', danger: true }))
+			],
+			note: 'The jobs that already finished keep what they did. Nothing is handed out after this.',
+			label: 'cancelled',
+			run: async () => {
+				await cancelRun(r.id);
+				return [{ name: r.id, ok: true, note: 'cancelled' }];
+			}
+		};
 	}
 
 	async function onStack(s: Stack) {
@@ -882,6 +1028,7 @@
 
 	// On a project page: esc leaves, 1–3 pick the tab, the rest is the tab's own.
 	function projectPageKey(e: KeyboardEvent) {
+		if (e.key === 'Escape' && projectTab === 'plan' && page?.closeTaskMenu()) return;
 		if (e.key === 'Escape') {
 			view = 'board';
 			if (projectRel) selectedId = projectRel;
@@ -923,6 +1070,10 @@
 				return deleteTask();
 			case 'X':
 				return releaseTask();
+			case 'A':
+				return assignAgent(project, tasks[taskSel]);
+			case 'i':
+				return focusDock();
 		}
 		return false;
 	}
@@ -1005,6 +1156,13 @@
 		if (confirm) return confirmKey(e);
 		if (picker) return pickerKey(e);
 		if (statusPicker) return statusKey(e);
+		if (newProj) {
+			if (e.key === 'Escape') newProj = null;
+			else if (e.key === 'Enter') createProject();
+			else return; // typing in the fields
+			e.preventDefault();
+			return;
+		}
 		if (e.target === filterEl) {
 			if (e.key === 'Escape') {
 				query = '';
@@ -1021,14 +1179,20 @@
 			e.preventDefault();
 			return;
 		}
-		// 1–3 switch top-level views, except on a project page, where they pick the
+		// 1–4 switch top-level views, except on a project page, where they pick the
 		// project's own tab.
-		if (view !== 'project' && /^[1-3]$/.test(e.key)) {
+		if (view !== 'project' && /^[1-4]$/.test(e.key)) {
 			view = VIEWS[+e.key - 1];
 			e.preventDefault();
 			return;
 		}
 		switch (e.key) {
+			case '+':
+				openNewProject();
+				break;
+			case '`':
+				toggleDock();
+				break;
 			case '/':
 				focusFilter();
 				break;
@@ -1041,7 +1205,9 @@
 				break;
 			default:
 				{
-					const handle = { board: boardKey, hygiene: hygieneKey, graveyard: graveKey, project: projectPageKey }[view];
+					const handle = { board: boardKey, hygiene: hygieneKey, graveyard: graveKey, agents: () => true, project: projectPageKey }[
+						view
+					];
 					if (handle(e) === false) return;
 				}
 		}
@@ -1049,7 +1215,8 @@
 	}
 
 	const keys: [string, string, string][] = [
-		['1 – 3', 'Board · Hygiene · Graveyard', 'board, hygiene, graveyard'],
+		['1 – 4', 'Board · Hygiene · Graveyard · Agents', 'board, hygiene, graveyard, agents'],
+		['+', 'new project: an orchestrator plans it and agents build it', 'any'],
 		['/  ctrl+k', 'filter projects (also matches status and next step)', 'any'],
 		['R', 'rescan now', 'any'],
 		['←↓↑→ / hjkl', 'move', 'board, planboard'],
@@ -1071,7 +1238,11 @@
 		['space', 'task done ⇄ to do', 'planboard'],
 		['enter', 'rename the selected task', 'planboard'],
 		['del', 'delete the selected task', 'planboard'],
+		['click a task', 'its menu: assign to an agent, move, rename, delete', 'planboard'],
+		['A', 'hand the selected task to a Claude agent (terminal in the dock)', 'planboard'],
 		['X', 'take a task back from an agent that stopped reporting in', 'planboard'],
+		['`', 'show / hide the agent dock', 'any'],
+		['i', 'type into the agent terminal (esc leaves)', 'planboard'],
 		['j / k', 'select process', 'garage'],
 		['i / enter', 'type into the terminal (esc leaves)', 'garage'],
 		['r · x', 'restart · stop (twice: kill)', 'garage'],
@@ -1108,11 +1279,19 @@
 				Graveyard
 				{#if view !== 'project'}<kbd>3</kbd>{/if}
 			</button>
+			<button class="tab" class:active={view === 'agents'} onclick={() => (view = 'agents')}>
+				Agents
+				{#if liveRuns.length}<span class="count run">{liveRuns.length}</span>{/if}
+				{#if view !== 'project'}<kbd>4</kbd>{/if}
+			</button>
 			{#if view === 'project' && project}
 				<span class="crumb">/ {project.name}</span>
 			{/if}
 		</nav>
 		{#if view !== 'project'}
+			<button class="newproj" onclick={openNewProject} title="New project, planned and built by agents (+)">
+				+ new project
+			</button>
 			<input
 				bind:this={filterEl}
 				bind:value={query}
@@ -1175,6 +1354,7 @@
 									{now}
 									procs={procsOf(p.rel)}
 									working={workingPer[p.rel] ?? 0}
+									sessions={sessionsPer[p.rel] ?? 0}
 									selected={p.rel === selectedId}
 									onselect={() => (selectedId = p.rel)}
 									ondetail={() => openProject(p.rel)}
@@ -1216,6 +1396,22 @@
 				onundo={undoBury}
 			/>
 		</main>
+	{:else if view === 'agents'}
+		<main>
+			<Agents
+				runs={runList}
+				{projects}
+				{procs}
+				{selectedJob}
+				{now}
+				onselect={(key) => (selectedJob = key)}
+				onopen={showAgent}
+				onstop={(pr) => onProcAction('stop', pr)}
+				oncancel={askCancelRun}
+				onproject={(rel) => openProject(rel, 'plan')}
+				ontask={gotoTask}
+			/>
+		</main>
 	{:else if view === 'project' && project}
 		<ProjectPage
 			bind:this={page}
@@ -1232,6 +1428,7 @@
 			selectedProcId={selectedProcId}
 			{taskSel}
 			claims={projectClaims}
+			agents={projectAgents}
 			{now}
 			{configPath}
 			ontab={(t) => (projectTab = t)}
@@ -1244,6 +1441,11 @@
 			ontasks={(next, note) => saveTasks(project, next, note)}
 			ontaskselect={(i) => (taskSel = i)}
 			onrelease={(i) => ((taskSel = i), releaseTask())}
+			onassign={(i) => ((taskSel = i), assignAgent(project, tasks[i]))}
+			onterminal={(i) => {
+				const t = tasks[i];
+				if (t?.id) showAgent(`${project.rel}#agent:${t.id}`);
+			}}
 			onprocselect={(id) => (selectedProcId = id)}
 			onprocaction={onProcAction}
 			onstack={onStack}
@@ -1253,6 +1455,25 @@
 		/>
 	{:else}
 		<main><p class="empty">Loading project…</p></main>
+	{/if}
+
+	{#if agentProcs.length}
+		<AgentDock
+			bind:this={dock}
+			agents={agentProcs}
+			runs={runList}
+			{projects}
+			selectedId={selectedAgent?.id ?? null}
+			open={dockOpen}
+			height={dockHeight}
+			{now}
+			onselect={(id) => (agentId === id && dockOpen ? (dockOpen = false) : showAgent(id))}
+			onaction={onProcAction}
+			ontoggle={toggleDock}
+			onheight={(h) => (dockHeight = h)}
+			ongoto={gotoAgentTask}
+			onrun={(pr) => ((selectedJob = `${pr.run_id}:${pr.job ?? ''}`), (view = 'agents'))}
+		/>
 	{/if}
 
 	<footer class="keys">
@@ -1274,6 +1495,7 @@
 			<span><kbd>a</kbd> add task</span>
 			<span><kbd>space</kbd> done</span>
 			<span><kbd>enter</kbd> rename</span>
+			<span><kbd>A</kbd> assign to agent</span>
 			<span><kbd>X</kbd> free from agent</span>
 			<span><kbd>n</kbd> next step</span>
 			<span><kbd>m</kbd> status</span>
@@ -1294,6 +1516,10 @@
 			<span><kbd>t</kbd> terminal</span>
 			<span><kbd>g</kbd> remote</span>
 			<span><kbd>r</kbd> run</span>
+		{:else if view === 'agents'}
+			<span><kbd>click</kbd> a session shows its terminal in the dock</span>
+			<span><kbd>+</kbd> new project</span>
+			<span><kbd>`</kbd> dock</span>
 		{:else if view === 'hygiene'}
 			<span><kbd>j</kbd><kbd>k</kbd> select</span>
 			<span><kbd>enter</kbd> fix / details</span>
@@ -1351,6 +1577,40 @@
 				{/each}
 			</ul>
 			<p class="foot">Plans are stored in <code>{plansPath}</code></p>
+		</div>
+	</div>
+{/if}
+
+{#if newProj}
+	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+	<div class="overlay" onclick={() => (newProj = null)}>
+		<div class="modal newp" onclick={(e) => e.stopPropagation()}>
+			<h2>New project</h2>
+			<p class="intro">
+				loods makes the folder, a git repository and a plan, then hands your goal to an orchestrator: it splits
+				the work into jobs and loods runs them as agents, several at a time. Watch them in Agents (<kbd>4</kbd>).
+			</p>
+			<label>
+				<span>name</span>
+				<!-- svelte-ignore a11y_autofocus -->
+				<input bind:value={newProj.name} placeholder="huizenzoeker" spellcheck="false" autofocus />
+			</label>
+			<label>
+				<span>group</span>
+				<input bind:value={newProj.group} placeholder="(none)" spellcheck="false" />
+			</label>
+			<label class="wide">
+				<span>what to build</span>
+				<textarea bind:value={newProj.goal} rows="3" placeholder="a house-hunting site with svelte and express"
+				></textarea>
+			</label>
+			<div class="acts">
+				<p class="foot">{root}/{newProj.group ? newProj.group + '/' : ''}{newProj.name || '…'}</p>
+				<button onclick={() => (newProj = null)}>cancel</button>
+				<button class="go" onclick={createProject} disabled={newBusy}>
+					<kbd>enter</kbd> {newBusy ? 'creating…' : 'create and plan it'}
+				</button>
+			</div>
 		</div>
 	</div>
 {/if}
@@ -1544,6 +1804,84 @@
 	.running {
 		font: 11.5px var(--mono);
 		color: var(--running);
+	}
+	.newproj {
+		flex: none;
+		border: 1px solid var(--line);
+		border-radius: 7px;
+		background: var(--card);
+		color: var(--text);
+		font: 12px var(--sans);
+		padding: 4px 9px;
+		cursor: pointer;
+	}
+	.newproj:hover {
+		border-color: var(--accent);
+		color: var(--accent);
+	}
+	.count.run {
+		background: var(--accent-soft);
+		color: var(--accent);
+	}
+	.modal.newp {
+		display: grid;
+		grid-template-columns: auto 1fr;
+		gap: 8px 10px;
+		align-items: center;
+		min-width: min(560px, 92vw);
+	}
+	.modal.newp h2,
+	.modal.newp .intro,
+	.modal.newp .acts,
+	.modal.newp label.wide {
+		grid-column: 1 / -1;
+	}
+	.modal.newp .intro {
+		margin: 0;
+		font-size: 12px;
+		color: var(--muted);
+	}
+	.modal.newp label {
+		display: contents;
+	}
+	.modal.newp label span {
+		font: 11.5px var(--mono);
+		color: var(--faint);
+	}
+	.modal.newp label.wide {
+		display: grid;
+		grid-template-columns: auto 1fr;
+		gap: 10px;
+		align-items: start;
+	}
+	.modal.newp input,
+	.modal.newp textarea {
+		border: 1px solid var(--line);
+		border-radius: 7px;
+		background: var(--panel);
+		color: var(--text);
+		font: 13px var(--sans);
+		padding: 5px 8px;
+		width: 100%;
+		resize: vertical;
+	}
+	.modal.newp input:focus,
+	.modal.newp textarea:focus {
+		outline: 1px solid var(--accent);
+	}
+	.modal.newp .acts {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-top: 4px;
+	}
+	.modal.newp .acts .foot {
+		margin: 0 auto 0 0;
+		font: 11.5px var(--mono);
+		color: var(--faint);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 	.working {
 		font: 11.5px var(--mono);

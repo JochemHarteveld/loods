@@ -21,13 +21,24 @@ const maxBacklog = 512 << 10 // terminal output kept per process for late viewer
 
 // Spec is what to run; a Proc is one run of it.
 type Spec struct {
-	ID      string `json:"id"` // "<project rel>#<command>" or "stack:<name>"
+	ID      string `json:"id"` // "<project rel>#<command>", "stack:<name>", "<rel>#agent:<task>", "<rel>#run:<id>", "<rel>#job:<run>:<job>"
 	Project string `json:"project,omitempty"`
-	Name    string `json:"name"`
-	Run     string `json:"run"`
-	Dir     string `json:"dir"`
-	Keys    bool   `json:"keys,omitempty"`
-	URL     string `json:"url,omitempty"`
+	// Kind: "" a project command or a stack, "agent" a Claude session on a task,
+	// "orchestrator" the session that owns a run, "job" one job of a run.
+	Kind string `json:"kind,omitempty"`
+	Task int    `json:"task,omitempty"` // the task number an agent was handed (kind "agent" or "job")
+	// RunID, Job and Role place a session in a run: which run it belongs to,
+	// which job it is doing and what that job is called. The dock and the Agents
+	// view put the jobs of a run under its orchestrator with these. (Run itself
+	// is taken: it is the command line, so this one is run_id in JSON.)
+	RunID string `json:"run_id,omitempty"`
+	Job   string `json:"job,omitempty"`
+	Role  string `json:"role,omitempty"`
+	Name  string `json:"name"`
+	Run   string `json:"run"`
+	Dir   string `json:"dir"`
+	Keys  bool   `json:"keys,omitempty"`
+	URL   string `json:"url,omitempty"`
 }
 
 type Proc struct {
@@ -78,6 +89,17 @@ func (m *Manager) getLocked(id string) *Proc {
 		}
 	}
 	return nil
+}
+
+// Find returns a copy of one process, so callers outside the Manager can read
+// its status without holding the lock.
+func (m *Manager) Find(id string) (Proc, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p := m.getLocked(id); p != nil {
+		return *p, true
+	}
+	return Proc{}, false
 }
 
 func (m *Manager) Start(s Spec) error {
