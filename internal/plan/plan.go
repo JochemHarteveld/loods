@@ -1,0 +1,310 @@
+// Package plan is where a project stands: status, priority, the next step,
+// notes, a numbered task list and a short log. Plans live in
+// ~/.config/loods/plans.yaml, written by the board, `loods plan` and Claude's
+// /wrapup, and read by everything.
+//
+// Task numbers are the point of the package: they stay with a task for as long
+// as the project has a plan, because you point at a task by its number in a
+// sentence ("do todo #4 of loods") and it has to keep meaning that task.
+package plan
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Statuses are the columns of the board, left to right.
+var Statuses = []string{"idea", "active", "paused", "shipped", "dead"}
+
+// TaskStates are the planboard columns of one project. "" is the first one.
+var TaskStates = []string{"", "doing", "done"}
+
+const (
+	maxNext  = 300
+	maxNotes = 20_000
+	maxTasks = 200
+	maxLog   = 30
+)
+
+type Plan struct {
+	Status   string    `yaml:"status,omitempty" json:"status,omitempty"`
+	Priority int       `yaml:"priority,omitempty" json:"priority,omitempty"` // 1 high … 3 low, 0 none
+	Next     string    `yaml:"next,omitempty" json:"next,omitempty"`
+	Notes    string    `yaml:"notes,omitempty" json:"notes,omitempty"`
+	Tasks    []Task    `yaml:"tasks,omitempty" json:"tasks,omitempty"`
+	Log      []Entry   `yaml:"log,omitempty" json:"log,omitempty"`
+	Updated  time.Time `yaml:"updated,omitempty" json:"updated,omitzero"`
+	// LastTaskID is the highest task number handed out here. Numbers stay stable
+	// and are not reused while the project has a plan.
+	LastTaskID int `yaml:"last_task_id,omitempty" json:"last_task_id,omitempty"`
+}
+
+// Task is written as a plain string: its number, then a markdown-style box.
+// "[x] " marks it done, "[~] " marks it in progress, no box (or "[ ] ") means to
+// do. The three boxes are the three columns of a project's planboard.
+//
+//   - '#8 [~] Shoot new store screenshots'
+type Task struct {
+	ID    int    `json:"id,omitempty"` // stable per project, see Plan.LastTaskID
+	Text  string `json:"text"`
+	State string `json:"state,omitempty"` // "" (to do), "doing", "done"
+}
+
+type Entry struct {
+	At   time.Time `yaml:"at" json:"at"`
+	By   string    `yaml:"by,omitempty" json:"by,omitempty"` // "you", "claude"
+	Text string    `yaml:"text" json:"text"`
+}
+
+func (t Task) Done() bool { return t.State == "done" }
+
+// Box is the task's column as the CLI prints it.
+func (t Task) Box() string {
+	switch t.State {
+	case "done":
+		return "[x]"
+	case "doing":
+		return "[~]"
+	default:
+		return "[ ]"
+	}
+}
+
+// mark is Box as the file writes it: nothing at all for a task still to do,
+// so a hand-written checklist stays as short as it was.
+func (t Task) mark() string {
+	if t.State == "" {
+		return ""
+	}
+	return t.Box() + " "
+}
+
+func (t Task) MarshalYAML() (any, error) {
+	if t.ID > 0 {
+		return fmt.Sprintf("#%d %s%s", t.ID, t.mark(), t.Text), nil
+	}
+	return t.mark() + t.Text, nil
+}
+
+func (t *Task) UnmarshalYAML(n *yaml.Node) error {
+	var s string
+	if err := n.Decode(&s); err != nil {
+		return err
+	}
+	*t = ParseTask(s)
+	return nil
+}
+
+// ParseTask reads one checklist line: an optional "#<n>" number, then an
+// optional box. Unknown boxes are left in the text, so a hand-written line is
+// never silently swallowed; a line without a number gets one on the next write.
+func ParseTask(s string) Task {
+	s = strings.TrimSpace(s)
+	var t Task
+	if rest, ok := strings.CutPrefix(s, "#"); ok {
+		digits := rest
+		if i := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' }); i >= 0 {
+			digits = rest[:i]
+		}
+		if n, err := strconv.Atoi(digits); err == nil && n > 0 {
+			t.ID = n
+			s = strings.TrimSpace(rest[len(digits):])
+		}
+	}
+	for _, b := range [][2]string{{"[x]", "done"}, {"[X]", "done"}, {"[~]", "doing"}, {"[ ]", ""}, {"[]", ""}} {
+		if rest, ok := strings.CutPrefix(s, b[0]); ok {
+			t.Text, t.State = strings.TrimSpace(rest), b[1]
+			return t
+		}
+	}
+	t.Text = s
+	return t
+}
+
+// FindTask takes the stable task number shown by `loods plan` and the board
+// ("#4"), or a piece of the task text. Numbers are not positions: they stay
+// with a task while it moves between columns.
+func FindTask(tasks []Task, ref string) (int, error) {
+	if n, err := strconv.Atoi(strings.TrimPrefix(ref, "#")); err == nil {
+		for i, t := range tasks {
+			if t.ID == n {
+				return i, nil
+			}
+		}
+		return 0, fmt.Errorf("no task #%d here (the numbers are the ones `loods plan` prints)", n)
+	}
+	found := -1
+	for i, t := range tasks {
+		if strings.Contains(strings.ToLower(t.Text), strings.ToLower(ref)) {
+			if found >= 0 {
+				return 0, fmt.Errorf("%q matches several tasks; use its number", ref)
+			}
+			found = i
+		}
+	}
+	if found < 0 {
+		return 0, fmt.Errorf("no task matches %q", ref)
+	}
+	return found, nil
+}
+
+// Empty reports whether nothing worth storing is left. LastTaskID alone does
+// not count: a plan wiped down to its counter leaves the file, and numbering
+// for that project starts over.
+func (p *Plan) Empty() bool {
+	return p.Status == "" && p.Priority == 0 && p.Next == "" && p.Notes == "" && len(p.Tasks) == 0 && len(p.Log) == 0
+}
+
+func (p *Plan) validate() error {
+	if p.Status != "" && !slices.Contains(Statuses, p.Status) {
+		return fmt.Errorf("status must be one of %s", strings.Join(Statuses, ", "))
+	}
+	if p.Priority < 0 || p.Priority > 3 {
+		return errors.New("priority must be 0 (none) to 3")
+	}
+	p.Next = strings.TrimSpace(strings.ReplaceAll(p.Next, "\n", " "))
+	if len(p.Next) > maxNext {
+		return fmt.Errorf("next step is longer than %d characters", maxNext)
+	}
+	if len(p.Notes) > maxNotes {
+		return fmt.Errorf("notes are longer than %d characters", maxNotes)
+	}
+	p.Tasks = slices.DeleteFunc(p.Tasks, func(t Task) bool { return strings.TrimSpace(t.Text) == "" })
+	if len(p.Tasks) > maxTasks {
+		return fmt.Errorf("more than %d tasks", maxTasks)
+	}
+	for i := range p.Tasks {
+		p.Tasks[i].Text = strings.TrimSpace(p.Tasks[i].Text)
+		if !slices.Contains(TaskStates, p.Tasks[i].State) {
+			return fmt.Errorf("task state must be empty, doing or done, not %q", p.Tasks[i].State)
+		}
+	}
+	p.numberTasks()
+	if len(p.Log) > maxLog {
+		p.Log = p.Log[len(p.Log)-maxLog:]
+	}
+	return nil
+}
+
+// numberTasks hands a number to every task that has none, and takes a duplicate
+// number (a hand edit, a copied line) away from the later of the two. Numbers
+// only ever go up, so a number you used in a conversation keeps its meaning.
+func (p *Plan) numberTasks() {
+	seen := map[int]bool{}
+	for i, t := range p.Tasks {
+		if t.ID > p.LastTaskID {
+			p.LastTaskID = t.ID
+		}
+		if t.ID > 0 && !seen[t.ID] {
+			seen[t.ID] = true
+			continue
+		}
+		p.LastTaskID++
+		p.Tasks[i].ID = p.LastTaskID
+		seen[p.LastTaskID] = true
+	}
+}
+
+// TaskByID finds a task by the number shown on the board.
+func (p *Plan) TaskByID(id int) (int, bool) {
+	for i, t := range p.Tasks {
+		if t.ID == id {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// SetState moves a task to a column by its number, and reports whether there
+// was such a task, so a caller can say so instead of changing nothing quietly.
+func (p *Plan) SetState(id int, state string) bool {
+	i, ok := p.TaskByID(id)
+	if ok {
+		p.Tasks[i].State = state
+	}
+	return ok
+}
+
+// OpenTasks are the ones still worth picking up, to do first.
+func (p *Plan) OpenTasks() []Task {
+	var todo, doing []Task
+	for _, t := range p.Tasks {
+		switch t.State {
+		case "":
+			todo = append(todo, t)
+		case "doing":
+			doing = append(doing, t)
+		}
+	}
+	return append(todo, doing...)
+}
+
+// AddLog appends one line to the project's log; empty text is ignored.
+func (p *Plan) AddLog(by, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	p.Log = append(p.Log, Entry{At: time.Now().Truncate(time.Second), By: by, Text: text})
+}
+
+// Patch is a partial update from the board; nil fields are left alone.
+type Patch struct {
+	Status   *string `json:"status"`
+	Priority *int    `json:"priority"`
+	Next     *string `json:"next"`
+	Notes    *string `json:"notes"`
+	Tasks    *[]Task `json:"tasks"`
+	Note     string  `json:"note"` // appended to the log
+}
+
+func (pp Patch) Apply(p *Plan, by string) {
+	if pp.Status != nil && *pp.Status != p.Status {
+		p.logStatus(by, p.Status, *pp.Status)
+		p.Status = *pp.Status
+	}
+	if pp.Priority != nil {
+		p.Priority = *pp.Priority
+	}
+	if pp.Next != nil {
+		p.Next = *pp.Next
+	}
+	if pp.Notes != nil {
+		p.Notes = *pp.Notes
+	}
+	if pp.Tasks != nil {
+		p.Tasks = *pp.Tasks
+	}
+	p.AddLog(by, pp.Note)
+}
+
+// logStatus records a status change. Changes by the same author within ten
+// minutes (dragging a card across columns) fold into one entry, and vanish
+// when the status ends up where it started.
+func (p *Plan) logStatus(by, from, to string) {
+	if n := len(p.Log); n > 0 {
+		last := p.Log[n-1]
+		if orig, _, ok := strings.Cut(strings.TrimPrefix(last.Text, "status "), " → "); ok &&
+			strings.HasPrefix(last.Text, "status ") && last.By == by && time.Since(last.At) < 10*time.Minute {
+			p.Log = p.Log[:n-1]
+			if orig == dash(to) {
+				return
+			}
+			from = strings.TrimSuffix(orig, "—")
+		}
+	}
+	p.AddLog(by, fmt.Sprintf("status %s → %s", dash(from), dash(to)))
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "—"
+	}
+	return s
+}

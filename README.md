@@ -20,6 +20,8 @@ loods --json        # one-off scan as JSON (includes sizes), for scripts or Clau
 loods new <name> "<what to build>"   # new project, planned and built by agents (see Runs)
 loods run           # the runs of a project: submit a graph of jobs, follow it, report back
 loods undo          # restore the last archived batch (shares ~/Archive/graveyard.log)
+loods deploy        # publish this project at <project>.loods.site (see Deploys)
+loods edge          # the origin behind the tunnel: route a hostname to what is deployed
 loods plan          # show / edit the plan of the project you are in (see Plans)
 loods todo          # list, claim and finish numbered tasks, by you or an agent (see Tasks)
 loods claude install  # /wrapup, /todo and /orchestrate skills + SessionStart hook for Claude Code
@@ -261,6 +263,60 @@ next start, so a run never waits for a session that is gone.
 `loods claude install` adds an `/orchestrate` skill that spells this loop out, and the sessions
 loods starts carry it in their prompt, so they report back with or without the skill installed.
 
+## Deploys
+
+Every project can be published at `<project>.loods.site`. One wildcard DNS record
+and one Cloudflare Tunnel cover the whole domain, so publishing a project is a build
+and a route — never a record, a certificate or a connector restart.
+
+```
+browser → Cloudflare edge   *.loods.site — TLS, Access
+        → Cloudflare Tunnel outbound-only; no port is opened
+        → loods edge        127.0.0.1:8080, routes on Host
+        → the project       a built directory, a process, or a compose service
+```
+
+```
+loods deploy                 # build and publish the project you are in
+loods deploy list [--all]    # what is published, and where it stands
+loods deploy log             # the build and the process output
+loods deploy stop            # offline, hostname kept
+loods deploy rm              # forget it
+loods deploy open            # its URL
+```
+
+A deploy is an ordinary loods process, which is the whole trick: it gets the same
+terminal, output backlog, stop sequence and orphan recovery as a dev server, and a
+build going wrong shows up in the dock like anything else. Three kinds, detected per
+project or written down in `~/.config/loods/deploys.yaml`:
+
+| kind | build | served as |
+|---|---|---|
+| `static` | `npm run build` (by lockfile) | the output directory, with an SPA fallback for navigations |
+| `proc` | optional | a long-running command on a port from 8900–8999, proxied |
+| `compose` | `docker compose up -d --build <service>` | the port compose published for that service |
+
+A project that builds *and* has a `start` script is a `proc`, not a directory:
+publishing only its output would quietly drop everything the server does.
+
+What loods remembers lives in `~/.local/state/loods/deploys.json`, and that file is
+also the routes file `loods edge` reads — the proxy needs a subset of exactly this,
+and keeping two files in step would be a bug waiting to happen. Ports are assigned
+once and kept, so a redeploy never moves a deploy under something that remembered it.
+
+Two rules that are easy to get wrong and are tested:
+
+- **A failed rebuild does not take the site down.** The directory of the last good
+  build stays routed; the board shows `failed (serving the last build)`.
+- **A stopped deploy says so.** Its route loses its target, so the hostname answers
+  "this deploy is not running" instead of a timeout or a 404.
+
+The edge answers 503, never 502, when a deploy's process is down: Cloudflare replaces
+an origin 502 or 504 with a generic page of its own, which would throw away the
+hostname and upstream the page exists to name.
+
+Setting the domain up once is [docs/deploy-plan.md](docs/deploy-plan.md).
+
 ## Hygiene
 
 Findings per project, worst first. Fixes always show what they will do and ask first.
@@ -366,10 +422,37 @@ stacks:
 ## Development
 
 ```
-go run . --no-open --dev   # API on :7777
-make dev             # UI with hot reload on :5173, proxies /api
+go run ./cmd/loods --no-open --dev   # API on :7777
+make dev                             # UI with hot reload on :5173, proxies /api
 make test
 ```
+
+### Code map
+
+`cmd/loods` parses the flags and either runs a subcommand or serves the board.
+Everything else is one package per concern, in dependency order:
+
+| Package | What it owns |
+| --- | --- |
+| `internal/xdg`, `internal/textfmt`, `internal/fsx`, `internal/ops` | where files live, how durations and counts are phrased, which dirs are generated, the result of one item of a batch action |
+| `internal/store` | durable files: read when they changed, change them under an exclusive lock, replace them in one step |
+| `internal/gitx` | every git command loods runs, and the parsing of what comes back |
+| `internal/hygiene` | what is wrong with a repository, as warnings with a named fix |
+| `internal/project` | discovery and scanning of the folders under the root: kind, activity, stack, commands |
+| `internal/config` | `config.yaml`: commands and stacks you add, override or hide |
+| `internal/plan`, `internal/claim`, `internal/run` | where a project stands, who is on which task, graphs of jobs and what may start now |
+| `internal/proc` | every process loods starts, each with a real terminal and an output backlog |
+| `internal/agent` | the Claude sessions: one per task, one orchestrator per run, one per job |
+| `internal/claude` | Claude's own transcripts, read incrementally |
+| `internal/github`, `internal/gitops`, `internal/graveyard`, `internal/scaffold`, `internal/skills`, `internal/desktop` | PRs and CI, branch cleanup with undo, archive and trash, new projects, Claude's skills and hook, opening things outside loods |
+| `internal/edge` | the origin behind the tunnel: one hostname per deploy, routed on `Host` to a built directory or a process |
+| `internal/deploy` | what each project publishes and how it is built, and what is published right now |
+| `internal/server` | the board: scan loops, the SSE snapshot, and the endpoints that act on it |
+| `internal/cli` | everything loods does without its window |
+| `web` | the Svelte app, and the embed that puts `dist/` in the binary |
+
+The server reaches the rest through the interfaces in `internal/server/deps.go`,
+so a handler reads as what it does and a test can put a stand-in behind one.
 
 ## Roadmap
 
@@ -380,4 +463,7 @@ make test
 5. ~~Project pages: per-project planboard, garage and git; numbered tasks an agent can claim~~
 6. ~~Runs: `loods new`, an orchestrator that plans a graph of jobs, a scheduler that runs them
    in parallel, and the Agents view~~
-7. Extras: activity feed, MCP server for clients without a shell, weekly digest, adb / serial devices
+7. Deploys: every project at `<project>.loods.site` over one Cloudflare Tunnel and one wildcard record —
+   `loods edge` routes on `Host`, `loods deploy` publishes, Access decides who may look
+   ([docs/deploy-plan.md](docs/deploy-plan.md))
+8. Extras: activity feed, MCP server for clients without a shell, weekly digest, adb / serial devices
