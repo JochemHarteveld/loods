@@ -167,7 +167,7 @@ func TestServerSchedulesAfterAJobReports(t *testing.T) {
 	if _, err := runs.Cancel(r.ID, "the user changed direction"); err != nil {
 		t.Fatal(err)
 	}
-	s.stopCancelled()
+	s.closeFinished()
 	until(t, "the cancelled session to stop", func() bool {
 		p, ok := s.procs.Find(procID)
 		return ok && !p.Alive()
@@ -185,5 +185,40 @@ func TestServerFailsJobsItCannotStart(t *testing.T) {
 	got, _ := runs.Get(r.ID)
 	if got.Jobs[0].Status != run.JobFailed || got.Status != run.Failed {
 		t.Fatalf("job %s, run %s; want both failed", got.Jobs[0].Status, got.Status)
+	}
+}
+
+// A job agent that reported back is a session with nothing left to do: `claude`
+// would sit there interactive forever, so loods stops it. The orchestrator is
+// left alone — it still owns the run.
+func TestServerClosesFinishedJobSessions(t *testing.T) {
+	s, it, runs := testServer(t, "sleep 30 #")
+	r, err := s.orchestrate(it, "goal", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runs.Submit(r.ID, []run.Job{
+		{ID: "stories", Role: "stories", Title: "t", Prompt: "p"},
+		{ID: "tickets", Role: "tickets", Title: "t", Prompt: "p", Needs: []string{"stories"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.tickRuns()
+	got, _ := runs.Get(r.ID)
+	i, _ := got.JobIndex("stories")
+	job := got.Jobs[i].ProcID
+	if p, ok := s.procs.Find(job); !ok || !p.Alive() {
+		t.Fatalf("the stories session is %+v, want a live one", p)
+	}
+	if _, err := runs.Finish(r.ID, "stories", run.JobDone, "nine stories"); err != nil {
+		t.Fatal(err)
+	}
+	s.tickRuns()
+	until(t, "the finished job's session to stop", func() bool {
+		p, ok := s.procs.Find(job)
+		return ok && !p.Alive()
+	})
+	if p, ok := s.procs.Find(r.Orchestrator); !ok || !p.Alive() {
+		t.Fatalf("the orchestrator is %+v, want it still running", p)
 	}
 }

@@ -45,6 +45,7 @@
 		taskSel: number;
 		claims: Record<number, Claim>; // by task number, this project only
 		agents: Record<number, Proc>; // by task number: agent terminals of this project
+		runsLive: number; // runs of this project that are still going
 		now: number;
 		configPath: string;
 		ontab: (t: Tab) => void;
@@ -65,6 +66,7 @@
 		onfix: (f: Finding) => void;
 		ondelete: (branches: Branch[], data: BranchList) => void;
 		onundo: () => void;
+		onorchestrate: () => void; // hand a goal to an orchestrator in this project
 	};
 	let {
 		p,
@@ -81,6 +83,7 @@
 		taskSel,
 		claims,
 		agents,
+		runsLive,
 		now,
 		configPath,
 		ontab,
@@ -100,7 +103,8 @@
 		onstack,
 		onfix,
 		ondelete,
-		onundo
+		onundo,
+		onorchestrate
 	}: Props = $props();
 
 	let editor = $state<ReturnType<typeof PlanEditor>>();
@@ -160,6 +164,10 @@
 		</nav>
 
 		<div class="acts">
+			<button class="btn orch" onclick={onorchestrate} title="Hand a goal to an orchestrator: it plans the work as jobs and loods runs them as agents (O)">
+				<kbd>O</kbd> orchestrate
+				{#if runsLive}<span class="count agent" title="{runsLive} run{runsLive === 1 ? '' : 's'} going">✻{runsLive}</span>{/if}
+			</button>
 			{#if live.length}
 				<button class="btn danger" onclick={onstop}><kbd>x</kbd> stop</button>
 			{:else}
@@ -376,6 +384,15 @@
 	.btn.go {
 		color: var(--running);
 		border-color: color-mix(in srgb, var(--running) 45%, var(--line));
+	}
+	/* Handing the whole project to agents is the one action here that starts
+	   something new, so it wears the accent the agent marks use. */
+	.btn.orch {
+		border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+		color: var(--accent);
+	}
+	.btn.orch:hover {
+		background: var(--accent-soft);
 	}
 	.btn.danger {
 		color: var(--danger);

@@ -38,7 +38,8 @@ Board: `hjkl`/arrows move · `enter` open the project page · `space` details dr
 `L` its garage · `c` VS Code · `t` terminal · `o` folder · `g` remote · `r` run · `x` stop ·
 `w` open web URL · `s` sort (activity / priority / name)
 
-Project page: `esc` back to the board · `1` Planboard · `2` Garage · `3` Git
+Project page: `esc` back to the board · `1` Planboard · `2` Garage · `3` Git ·
+`O` hand a goal to an orchestrator (it plans the jobs, agents build them)
 
 Board and project page: `n` next step · `N` notes · `a` add task · `m` status · `p` priority ·
 `c`/`t`/`o`/`g` open · `r` run · `x` stop · `w` web URL
@@ -189,6 +190,10 @@ loods new -g blauweschuit barsys2 "…"      # in a group folder
 loods new --no-agent …                     # only the project and its plan
 ```
 
+A project that already exists gets an orchestrator from its own page: *orchestrate* in the
+header (`O`) asks for the goal — prefilled with the plan's next step — and hands it to one,
+the same way `loods new` does for a new project.
+
 The folder, a git repository and a plan exist within a second, so the project is on the board
 before anything is built. Then loods starts an **orchestrator**: a Claude session in that
 project whose job is to plan, not to build. It writes a graph of jobs and hands it to loods:
@@ -206,6 +211,11 @@ jobs:
     title: Write the user stories
     prompt: |
       Write docs/userstories.md …
+    steps:
+      - List the user roles
+      - Write the stories of the first role
+      - Write the stories of the other roles
+      - Add acceptance criteria to every story
   - id: tickets
     role: tickets
     needs: [stories]
@@ -213,6 +223,10 @@ jobs:
     title: Turn the user stories into tasks on the planboard
     prompt: |
       One `loods todo add` per story …
+    steps:
+      - Read docs/userstories.md
+      - Add one task per story
+      - Report the task numbers
 ```
 
 loods starts a job as soon as everything it `needs` is done, at most `--max-parallel` sessions
@@ -222,6 +236,22 @@ so two runs on one repo take turns while runs on different projects never wait f
 Here `repo` and `stories` start together, `tickets` follows `stories`, and a job with
 `task: 2` claims that planboard task so the card shows it as live work.
 
+Every job is handed a **checklist** before it starts: `steps`, the small pieces the
+orchestrator cut the job into. The agent ticks one off as it finishes it, which is the only
+thing that says how far a session really is — without it a job is a terminal that has been
+busy for eleven minutes and nothing more. The ticks become a percentage, a forecast of the
+time left and a list of green checkmarks on the board:
+
+```
+loods run step <run>:<job> 2       # step 2 of its checklist is done
+```
+
+The forecast is the pace of the steps a job already finished, applied to the ones it has left,
+so steps of roughly equal size keep it honest; a run's own forecast is the longest job running
+now plus the jobs still waiting for a session, in waves of `--max-parallel`. Reporting done
+ticks whatever is left on the list, because the job is what the session was for; a job that
+fails keeps its checklist as it is, since how far it got is the part you need to read.
+
 Each job is an ordinary loods process, so it has the same terminal, output backlog and stop as
 a dev server, and it reports back itself:
 
@@ -229,6 +259,10 @@ a dev server, and it reports back itself:
 loods run done <run>:<job> --note "what you did"
 loods run fail <run>:<job> --note "why"
 ```
+
+Reporting back also ends the session: `claude` is interactive and would otherwise sit there
+with its work done, so loods stops a job's session once its job is over, leaving the terminal
+in the dock to read. The orchestrator keeps running — it owns the run and may still extend it.
 
 Nothing that depends on a job starts until it reports. A job whose session ends without
 reporting is a failure — the run has no way to know what it built — and everything that needed
@@ -240,9 +274,12 @@ or a job without a prompt is refused as a whole, so nothing starts half-planned.
 The **Agents** view (`4`) is one card per run: the orchestrator on top, then the jobs in waves —
 everything in one column may run at the same time, and each column waits for the one before it.
 Every job line says what it is doing, or why it is not: `waits for stories`,
-`waits for a free repo (repo has it)`, or the note its agent left. Clicking a line brings that
-session's terminal up in the dock, where the tabs of a run sit together with the orchestrator
-first. *cancel run* stops handing out work and stops the sessions it started.
+`waits for a free repo (repo has it)`, or the note its agent left. Under it sits its progress:
+a bar, `2/4 steps`, `50% · ~6m left`, and the checklist itself — open while the job is
+working, a click away otherwise, with a green checkmark against every step that is done. The
+run's header carries the same for the whole graph. Clicking a line brings that session's
+terminal up in the dock, where the tabs of a run sit together with the orchestrator first.
+*cancel run* stops handing out work and stops the sessions it started.
 
 ```
 loods run                          # the runs of this project (--all for every project)
@@ -250,6 +287,7 @@ loods run new "<goal>"             # a run with no jobs yet; prints its id
 loods run submit <run> --file -    # give it its graph (YAML on stdin or a file)
 loods run extend <run> --file -    # add jobs to a run that is already going
 loods run status <run> --watch     # print it whenever something moves
+loods run step <run>:<job> <n>     # step n of this job's checklist is done
 loods run done|fail <run>:<job> --note "…"
 loods run cancel <run>
 ```
@@ -406,7 +444,8 @@ stacks:
 ## How it works
 
 - Runs are scheduled in the same two-second pass that picks up plan edits: read what the agents
-  wrote, turn ended sessions into finished jobs, then start whatever may run now.
+  wrote, turn ended sessions into finished jobs, start whatever may run now, then close the
+  sessions of the jobs that are over.
 - Rescans every 30 s (or `R`) and pushes a snapshot over SSE; the UI only re-renders when something changed.
   Plan edits, task claims and new Claude transcript lines are picked up between scans, so a
   `loods todo claim` in a terminal shows up on the board within two seconds.

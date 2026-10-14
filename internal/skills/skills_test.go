@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,5 +40,43 @@ func TestEditHooksKeepsOtherSettings(t *testing.T) {
 	b, _ = os.ReadFile(path)
 	if strings.Contains(string(b), "SessionStart") || !strings.Contains(string(b), `"notify"`) {
 		t.Errorf("uninstall left:\n%s", b)
+	}
+}
+
+// The orchestrate skill is the only place the lessons of a finished run are
+// written down, so the rules that cost a run an hour to learn are asserted
+// here: a graph is cut by coupling, the boundary is declared in the graph, the
+// harness is shared, and the job that merges neither designs nor judges.
+func TestOrchestrateSkillCarriesTheSeamRules(t *testing.T) {
+	for _, want := range []string{
+		"Cut the seams by coupling, not by file",
+		"`owns: [paths]`",
+		"One owner per acceptance number",
+		"Build the shared harness first",
+		"merges and does not design",
+		"Give the judging to someone else",
+	} {
+		if !strings.Contains(orchestrateSkill, want) {
+			t.Errorf("the orchestrate skill does not mention %q", want)
+		}
+	}
+}
+
+// Numbered steps are what the skill is read by, so a renumbering that drops or
+// repeats one is caught here rather than by a confused orchestrator.
+func TestOrchestrateSkillStepsAreInOrder(t *testing.T) {
+	n := 0
+	for _, line := range strings.Split(orchestrateSkill, "\n") {
+		var got int
+		if _, err := fmt.Sscanf(line, "%d. ", &got); err != nil {
+			continue
+		}
+		n++
+		if got != n {
+			t.Fatalf("step %d is numbered %d:\n%s", n, got, line)
+		}
+	}
+	if n < 8 {
+		t.Errorf("found %d numbered steps, expected the whole walkthrough", n)
 	}
 }

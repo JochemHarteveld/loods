@@ -67,3 +67,24 @@ func OrDash(s string) string {
 	}
 	return s
 }
+
+// Dur is how long something still needs, in the shortest honest form: "<1m",
+// "7m", "1h20m", "2d". Used for the time left on a job or a run, where a
+// seconds-exact answer would only pretend to know more than the forecast does.
+func Dur(d time.Duration) string {
+	if d < time.Minute {
+		return "<1m"
+	}
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		h, m := int(d.Hours()), int(d.Minutes())%60
+		if m == 0 {
+			return fmt.Sprintf("%dh", h)
+		}
+		return fmt.Sprintf("%dh%02dm", h, m)
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}

@@ -168,7 +168,14 @@ func orchestratorPrompt(it *project.Item, r run.Run) string {
 		"worktree and a branch of its own, so they commit at the same time. End with one " +
 		"`exclusive: repo` job that needs them all and merges their branches — nobody else " +
 		"will.\n\n")
-	b.WriteString("1. Write the graph and submit it (one job per piece of work, each with its own prompt):\n\n")
+	b.WriteString("Every job carries a checklist: `steps:`, a list of the small pieces the job " +
+		"is made of, written before it starts. The agent ticks one off with " +
+		"`loods run step <run>:<job> <n>` as it finishes it, which is the only thing that " +
+		"tells the board — and you — how far a session actually is. Cut each job into 3 to 8 " +
+		"steps of roughly the same size, each one a thing that is either done or not; the " +
+		"forecast of the time left is the pace of the steps a job finished applied to the " +
+		"ones it has left, so steps of wildly different sizes make it lie.\n\n")
+	b.WriteString("1. Write the graph and submit it (one job per piece of work, each with its own prompt and steps):\n\n")
 	fmt.Fprintf(&b, "   loods run submit %s --file - <<'JOBS'\n", r.ID)
 	b.WriteString(DefaultGraph)
 	b.WriteString("   JOBS\n\n")
@@ -195,6 +202,12 @@ const DefaultGraph = `   jobs:
          Make this folder a git repository with a .gitignore and a README that
          names the project and its stack, commit it, then create a private
          GitHub repository with gh and push. Report the repository URL.
+       steps:
+         - git init with a .gitignore for this stack
+         - Write the README with what it is and which stack
+         - Commit everything
+         - Create the private GitHub repository with gh
+         - Push and report the URL
      - id: stories
        role: stories
        title: Write the user stories
@@ -202,6 +215,11 @@ const DefaultGraph = `   jobs:
          Write docs/userstories.md: the user roles, and per role the user
          stories that cover the goal, each with acceptance criteria. Keep them
          small enough to become one ticket each.
+       steps:
+         - List the user roles
+         - Write the stories of the first role
+         - Write the stories of the other roles
+         - Add acceptance criteria to every story
      - id: tickets
        role: tickets
        needs: [stories]
@@ -210,6 +228,11 @@ const DefaultGraph = `   jobs:
          Read docs/userstories.md and add one task per story with
          'loods todo add "…"'. Each task has to be actionable on its own.
          Report the numbers you added.
+       steps:
+         - Read docs/userstories.md
+         - Add a task per story of the first role
+         - Add a task per story of the other roles
+         - Report the task numbers
      - id: scaffold
        role: scaffold
        needs: [repo]
@@ -218,6 +241,11 @@ const DefaultGraph = `   jobs:
        prompt: |
          Set up the project skeleton for the stack in the goal, with a working
          dev command and a README that says how to run it. Commit and push.
+       steps:
+         - Create the project skeleton for the stack
+         - Get the dev command running
+         - Write the run instructions in the README
+         - Commit and push
 `
 
 // jobPrompt is what one job's session starts with: what to build, and how to
@@ -237,10 +265,33 @@ func jobPrompt(it *project.Item, r run.Run, j run.Job) string {
 			JobWorktree(it, r, j), run.WorktreeBranch(r.ID, j.ID), it.Path,
 			run.WorktreeBranch(r.ID, j.ID), run.WorktreeBranch(r.ID, j.ID))
 	}
+	if len(j.Owns) > 0 {
+		fmt.Fprintf(&b, "The files this job owns: %s. Those are yours alone — no other job of this run "+
+			"may touch them. The other side of that bargain is that everything outside them belongs to "+
+			"somebody else: a change you need there goes in your report or on the board "+
+			"(`loods todo add \"…\"`), not into the file.\n\n", strings.Join(j.Owns, ", "))
+	}
+	if lanes := neededOwners(r, j); lanes != "" {
+		fmt.Fprintf(&b, "What the jobs you wait for own, so you know whose work you are holding when you "+
+			"land or review it:\n\n%s\n", lanes)
+	}
 	if j.Task > 0 {
 		fmt.Fprintf(&b, "This job is task #%d on the planboard: run `loods todo claim %s#%d` before "+
 			"you start and `loods todo heartbeat %s#%d` as you go, so the board shows it as live work.\n\n",
 			j.Task, it.Rel, j.Task, it.Rel, j.Task)
+	}
+	if len(j.Steps) > 0 {
+		b.WriteString("Your checklist. Work through it in order and tick a step off the moment it is " +
+			"really done — the board shows your progress and the time you have left from these " +
+			"ticks, and they are the only thing anybody can see from outside your session:\n\n")
+		for i, st := range j.Steps {
+			fmt.Fprintf(&b, "  %d. %s\n", i+1, st.Text)
+		}
+		fmt.Fprintf(&b, "\nTick one off with `loods run step %s <n>` (so `loods run step %s 1` for the "+
+			"first). Do not tick a step you have not finished, and do not tick them all at the end: "+
+			"a bar that jumps from 0%% to 100%% tells nobody anything. If the work turns out to be "+
+			"different from the list, do the job the prompt describes, tick what matches, and say so "+
+			"in your report.\n\n", ref, ref)
 	}
 	fmt.Fprintf(&b, "Report back when you are done — nothing that depends on your job starts until you do:\n"+
 		"  loods run done %s --note \"what you did\"\n"+
@@ -248,5 +299,21 @@ func jobPrompt(it *project.Item, r run.Run, j run.Job) string {
 		"  loods run fail %s --note \"why, and what you did leave behind\"\n\n", ref, ref)
 	b.WriteString("Stay inside your job. Work you discover that belongs to someone else goes on the board " +
 		"(`loods todo add \"…\"`) or in your report, not into this session.")
+	return b.String()
+}
+
+// neededOwners is the ownership map of the jobs this one waits for, as lines
+// for its prompt. A merge job needs it most: it is handed three branches and
+// has to know which lane decided what, and the owners are that map.
+func neededOwners(r run.Run, j run.Job) string {
+	owners := r.Owners()
+	var b strings.Builder
+	for _, need := range j.Needs {
+		paths, ok := owners[need]
+		if !ok {
+			continue
+		}
+		fmt.Fprintf(&b, "  - %s: %s\n", need, strings.Join(paths, ", "))
+	}
 	return b.String()
 }

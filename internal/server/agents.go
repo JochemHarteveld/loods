@@ -173,7 +173,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.stopCancelled()
+	s.closeFinished()
 	s.publish(false)
 	writeJSON(w, r2)
 }

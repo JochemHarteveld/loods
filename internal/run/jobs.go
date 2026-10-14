@@ -20,6 +20,11 @@ type jobInput struct {
 	Exclusive string   `yaml:"exclusive"`
 	Isolation string   `yaml:"isolation"`
 	Task      int      `yaml:"task"`
+	// Owns is the paths this job is the only one allowed to change. See owns.go.
+	Owns []string `yaml:"owns"`
+	// Steps is the checklist, as a plain list of lines: the whole job cut into
+	// pieces small enough that ticking one off means something.
+	Steps []string `yaml:"steps"`
 }
 
 // ParseJobs reads a graph. Both `jobs:` with a list under it and a bare list
@@ -46,10 +51,14 @@ func ParseJobs(b []byte) ([]Job, error) {
 	}
 	out := make([]Job, 0, len(in))
 	for _, j := range in {
+		steps := make([]Step, 0, len(j.Steps))
+		for _, text := range j.Steps {
+			steps = append(steps, Step{Text: text})
+		}
 		out = append(out, Job{
 			ID: j.ID, Role: j.Role, Title: j.Title, Prompt: j.Prompt,
 			Needs: j.Needs, Exclusive: j.Exclusive, Isolation: j.Isolation, Task: j.Task,
-			Status: JobPending,
+			Owns: j.Owns, Steps: steps, Status: JobPending,
 		})
 	}
 	return out, nil

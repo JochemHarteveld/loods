@@ -82,6 +82,14 @@ type Job struct {
 	// declare `exclusive: repo` still run at the same time.
 	Isolation string `json:"isolation,omitempty"`
 	Task      int    `json:"task,omitempty"` // planboard task this job owns, if any
+	// Owns is the paths only this job may change: the lane boundary between
+	// jobs that run at the same time, checked when the graph is submitted
+	// rather than left to a design doc nobody enforces. See owns.go.
+	Owns []string `json:"owns,omitempty"`
+	// Steps is the checklist the job is handed before it starts: small pieces
+	// of work it ticks off as it goes, which is where the board's percentage
+	// and its forecast come from. See steps.go.
+	Steps []Step `json:"steps,omitempty"`
 
 	Status    string    `json:"status"`
 	ProcID    string    `json:"proc,omitempty"` // the process it runs as, once started
@@ -337,6 +345,12 @@ func (r *Run) validate() error {
 		if j.Status == "" {
 			j.Status = JobPending
 		}
+		if err := j.validateSteps(); err != nil {
+			return err
+		}
+		if err := j.validateOwns(); err != nil {
+			return err
+		}
 	}
 	for _, j := range r.Jobs {
 		for _, need := range j.Needs {
@@ -348,7 +362,10 @@ func (r *Run) validate() error {
 			}
 		}
 	}
-	return r.acyclic()
+	if err := r.acyclic(); err != nil {
+		return err
+	}
+	return r.ownersDisjoint()
 }
 
 // acyclic reports the first cycle it finds, naming the jobs in it: a graph that

@@ -244,8 +244,45 @@ func (s *Store) Starting(runID, job, procID string) (Run, error) {
 	})
 }
 
+// Step is how a job agent says how far it got: step n of its checklist is
+// done. Ticking is idempotent — a tick that was already there changes nothing
+// and is not an error, because an agent that repeats itself should not have to
+// handle a failure. n is 1-based, the way the prompt numbers them.
+//
+// A job that is over is refused: its percentage is settled, and a late tick
+// would move a bar nobody is watching any more.
+func (s *Store) Step(runID, job string, n int) (Run, error) {
+	return s.change(runID, func(r *Run) error {
+		i, ok := r.JobIndex(job)
+		if !ok {
+			return fmt.Errorf("run %s has no job %q", runID, job)
+		}
+		j := &r.Jobs[i]
+		if len(j.Steps) == 0 {
+			return fmt.Errorf("job %s:%s has no checklist to tick off", runID, job)
+		}
+		if n < 1 || n > len(j.Steps) {
+			return fmt.Errorf("job %s:%s has steps 1..%d, not %d", runID, job, len(j.Steps), n)
+		}
+		if j.Over() {
+			return fmt.Errorf("job %s:%s is already %s", runID, job, j.Status)
+		}
+		if j.Steps[n-1].Done {
+			return nil
+		}
+		j.Steps[n-1].Done = true
+		j.Steps[n-1].DoneAt = time.Now().Truncate(time.Second)
+		return nil
+	})
+}
+
 // Finish is how a job agent reports back: done with what it did, or failed with
 // why. Both notes end up in the Agents view, so "done" is not a useful note.
+//
+// A job that reports done ticks off whatever it left on its checklist: the job
+// is what the session was for, so a finished job showing 3/5 would only be the
+// agent forgetting to say so. A failed job keeps its checklist as it is — how
+// far it got is exactly what the orchestrator has to read.
 func (s *Store) Finish(runID, job, status, note string) (Run, error) {
 	if status != JobDone && status != JobFailed {
 		return Run{}, fmt.Errorf("a job finishes done or failed, not %q", status)
@@ -258,8 +295,16 @@ func (s *Store) Finish(runID, job, status, note string) (Run, error) {
 		if r.Jobs[i].Over() {
 			return fmt.Errorf("job %s:%s is already %s", runID, job, r.Jobs[i].Status)
 		}
+		now := time.Now().Truncate(time.Second)
 		r.Jobs[i].Status, r.Jobs[i].Note = status, strings.TrimSpace(note)
-		r.Jobs[i].EndedAt = time.Now().Truncate(time.Second)
+		r.Jobs[i].EndedAt = now
+		if status == JobDone {
+			for k := range r.Jobs[i].Steps {
+				if !r.Jobs[i].Steps[k].Done {
+					r.Jobs[i].Steps[k].Done, r.Jobs[i].Steps[k].DoneAt = true, now
+				}
+			}
+		}
 		return nil
 	})
 }

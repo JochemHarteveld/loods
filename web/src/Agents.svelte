@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { isAlive, jobOver, runOver, type AgentRun, type Job, type Proc, type Project } from './lib/api';
 	import { ago } from './lib/time';
+	import { jobETA, jobProgress, left, pct, runETA, runProgress, stepsDone } from './lib/steps';
 
 	// The Agents view: one card per run, so you can see at a glance which agents
 	// are working, which one is the orchestrator and what every other session is
@@ -83,6 +84,38 @@
 		const p = proc(j ? j.proc : r.orchestrator);
 		if (p) onopen(p.id);
 	}
+
+	// Checklists: a job is handed its steps before it starts and ticks them off
+	// as it goes, which is the only thing that says how far a session really is.
+	// The list of a working job is open, because that is the one you came to
+	// look at; everything else is a line you can unfold. A click is remembered
+	// either way, so a list you opened does not shut itself when the job ends.
+	let folds = $state<Record<string, boolean>>({});
+	const key = (r: AgentRun, j: Job) => `${r.id}:${j.id}`;
+	const steps = (j: Job) => j.steps ?? [];
+	const unfolded = (r: AgentRun, j: Job) => folds[key(r, j)] ?? j.status === 'running';
+	const fold = (r: AgentRun, j: Job) => (folds[key(r, j)] = !unfolded(r, j));
+
+	/** The percentage and, while it runs, how much longer the job needs. */
+	function forecast(j: Job): string {
+		const d = jobETA(j, now);
+		if (d === null || jobOver(j)) return `${pct(jobProgress(j))}%`;
+		return `${pct(jobProgress(j))}% · ${about(d)} left`;
+	}
+
+	/** The same for a whole run, as the run header's last field. */
+	function runForecast(r: AgentRun): string {
+		if (!r.jobs?.length) return '';
+		const d = runETA(r, now);
+		if (d === null) return `${pct(runProgress(r))}%`;
+		return `${pct(runProgress(r))}% · ${about(d)} left`;
+	}
+
+	// "~4m", but "<1m" on its own: the "<" is already the hedge the ~ is for.
+	const about = (ms: number) => {
+		const t = left(ms);
+		return t.startsWith('<') ? t : `~${t}`;
+	};
 </script>
 
 <div class="agents">
@@ -113,6 +146,12 @@
 					{projectName(r.project)}
 				</button>
 				<span class="meta">{r.id} · {tally(r)} · {r.max_parallel} at a time</span>
+				{#if r.jobs?.length}
+					<span class="bar wide" title="how far the jobs of this run are">
+						<span class="fill" style:width="{pct(runProgress(r))}%"></span>
+					</span>
+					<span class="meta">{runForecast(r)}</span>
+				{/if}
 				{#if !runOver(r)}
 					<button class="btn danger" onclick={() => oncancel(r)} title="Stop handing out work and stop its sessions">
 						cancel run
@@ -139,21 +178,49 @@
 					<div class="jobs">
 						{#each col as j (j.id)}
 							{@const p = proc(j.proc)}
-							<div class="row job {j.status}" class:active={selectedJob === `${r.id}:${j.id}`}>
-								<button class="open" onclick={() => pick(r, j)} title={j.title}>
-									<span class="dot {j.status}"></span>
-									<span class="role">{j.role || j.id}</span>
-									<span class="state">{j.status}{clock(j) ? ` · ${clock(j)}` : ''}</span>
-									<span class="what">{why(r, j)}</span>
-								</button>
-								{#if j.task}
-									<button class="act" onclick={() => ontask(r.project, j.task!)} title="Open the planboard of task #{j.task}">
-										#{j.task}
+							<div class="jobbox">
+								<div class="row job {j.status}" class:active={selectedJob === `${r.id}:${j.id}`}>
+									<button class="open" onclick={() => pick(r, j)} title={j.title}>
+										<span class="dot {j.status}"></span>
+										<span class="role">{j.role || j.id}</span>
+										<span class="state">{j.status}{clock(j) ? ` · ${clock(j)}` : ''}</span>
+										<span class="what">{why(r, j)}</span>
 									</button>
-								{/if}
-								{#if j.exclusive}<span class="lock" title="only one job at a time may hold {j.exclusive}">{j.exclusive}</span>{/if}
-								{#if p && isAlive(p)}
-									<button class="act" onclick={() => onstop(p)}>stop</button>
+									{#if j.task}
+										<button class="act" onclick={() => ontask(r.project, j.task!)} title="Open the planboard of task #{j.task}">
+											#{j.task}
+										</button>
+									{/if}
+									{#if j.exclusive}<span class="lock" title="only one job at a time may hold {j.exclusive}">{j.exclusive}</span>{/if}
+									{#if p && isAlive(p)}
+										<button class="act" onclick={() => onstop(p)}>stop</button>
+									{/if}
+								</div>
+
+								{#if steps(j).length}
+									<div class="prog">
+										<button
+											class="fold"
+											onclick={() => fold(r, j)}
+											aria-expanded={unfolded(r, j)}
+											title={unfolded(r, j) ? 'Hide its steps' : 'Show its steps'}
+										>
+											<span class="chev" class:down={unfolded(r, j)}>›</span>
+											{stepsDone(j)}/{steps(j).length} steps
+										</button>
+										<span class="bar"><span class="fill {j.status}" style:width="{pct(jobProgress(j))}%"></span></span>
+										<span class="num">{forecast(j)}</span>
+									</div>
+									{#if unfolded(r, j)}
+										<ol class="steps">
+											{#each steps(j) as s, n (n)}
+												<li class:done={s.done}>
+													<span class="tick" class:on={s.done}>{s.done ? '✓' : n + 1}</span>
+													<span class="text">{s.text}</span>
+												</li>
+											{/each}
+										</ol>
+									{/if}
 								{/if}
 							</div>
 						{/each}
@@ -299,6 +366,7 @@
 	.jobs {
 		display: grid;
 		grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+		align-items: start;
 		gap: 6px;
 		flex: 1;
 		min-width: 0;
@@ -419,7 +487,112 @@
 		border-color: transparent;
 		background: var(--chip);
 	}
-	.pending {
+	/* A job and its checklist are one cell of the wave grid. */
+	.jobbox {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+		min-width: 0;
+	}
+	.prog {
+		display: flex;
+		align-items: center;
+		gap: 7px;
+		padding: 0 8px 0 10px;
+	}
+	.fold {
+		flex: none;
+		display: flex;
+		align-items: center;
+		gap: 3px;
+		border: 0;
+		background: none;
+		padding: 0;
+		cursor: pointer;
+		font: 11px var(--mono);
+		color: var(--muted);
+	}
+	.fold:hover {
+		color: var(--text);
+	}
+	.chev {
+		display: inline-block;
+		transition: transform 0.12s ease;
+		font-size: 13px;
+		line-height: 1;
+	}
+	.chev.down {
+		transform: rotate(90deg);
+	}
+	.bar {
+		flex: 1;
+		min-width: 40px;
+		height: 4px;
+		border-radius: 3px;
+		background: var(--chip);
+		overflow: hidden;
+	}
+	.bar.wide {
+		flex: none;
+		width: 90px;
+	}
+	.fill {
+		display: block;
+		height: 100%;
+		background: var(--accent);
+		transition: width 0.3s ease;
+	}
+	.fill.running {
+		background: var(--running);
+	}
+	.fill.failed,
+	.fill.blocked,
+	.fill.cancelled {
+		background: var(--danger);
+	}
+	.num {
+		flex: none;
+		font: 11px var(--mono);
+		color: var(--muted);
+	}
+	.steps {
+		margin: 1px 0 4px;
+		padding: 0 8px 0 10px;
+		list-style: none;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.steps li {
+		display: flex;
+		align-items: baseline;
+		gap: 6px;
+		font-size: 11.5px;
+		color: var(--muted);
+		min-width: 0;
+	}
+	.steps li.done .text {
+		color: var(--faint);
+	}
+	.tick {
+		flex: none;
+		width: 14px;
+		text-align: center;
+		font: 10px var(--mono);
+		color: var(--faint);
+	}
+	.tick.on {
+		color: var(--running);
+		font-size: 11px;
+		font-weight: 700;
+	}
+	.steps .text {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	p.pending {
 		margin: 8px 0 0 64px;
 		font-size: 12px;
 		color: var(--faint);
@@ -429,7 +602,7 @@
 			padding: 14px 16px 24px;
 		}
 		.row.orch,
-		.pending {
+		p.pending {
 			margin-left: 0;
 		}
 		.lane {

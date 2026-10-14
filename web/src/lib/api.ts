@@ -95,12 +95,19 @@ export type JobState =
   | "failed"
   | "blocked"
   | "cancelled";
+/**
+ * One item of a job's checklist, written by the orchestrator before the job
+ * starts and ticked off by the agent with `loods run step <run>:<job> <n>`.
+ */
+export type Step = { text: string; done?: boolean; done_at?: string };
 export type Job = {
   id: string;
   role: string;
   title: string;
   prompt: string;
   needs?: string[];
+  /** The checklist: where the percentage and the time left come from. */
+  steps?: Step[];
   /** Something only one job may hold at a time, per project: "repo" commits. */
   exclusive?: string;
   task?: number; // planboard task this job owns

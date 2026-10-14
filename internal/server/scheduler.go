@@ -5,6 +5,7 @@ import (
 
 	"loods/internal/agent"
 	"loods/internal/gitops"
+	"loods/internal/proc"
 	"loods/internal/run"
 )
 
@@ -13,15 +14,16 @@ import (
 // show up in the dock. `loods run` only writes runs.json; this pass picks that
 // up, notices sessions that ended, and starts whatever may run now.
 
-// tickRuns is one pass of three steps, in this order: read what the agents
-// wrote, turn ended sessions into finished jobs, then hand out work. Returns
-// whether anything changed, so the watch loop knows to publish.
+// tickRuns is one pass of four steps, in this order: read what the agents
+// wrote, turn ended sessions into finished jobs, hand out work, then close the
+// sessions that have nothing left to do. Returns whether anything changed, so
+// the watch loop knows to publish.
 func (s *Server) tickRuns() bool {
 	changed := s.runs.Refresh()
 	changed = s.reapJobs() || changed
 	before := s.runs.All()
 	s.runs.Tick(s.startJob)
-	s.stopCancelled()
+	s.closeFinished()
 	return changed || !sameRuns(before, s.runs.All())
 }
 
@@ -82,27 +84,43 @@ func (s *Server) startJob(r run.Run, j run.Job) (string, error) {
 	return spec.ID, nil
 }
 
-// stopCancelled stops the sessions of jobs that were cancelled while they were
-// running, so `loods run cancel` really ends the work and not just the
-// bookkeeping.
-func (s *Server) stopCancelled() {
+// closeFinished stops the sessions that have nothing left to do: the session of
+// a job that is over, and the orchestrator of a run that was cancelled.
+//
+// A job agent reports back with `loods run done` and then sits there, because
+// `claude` is an interactive session: it does not exit when its work is done,
+// so without this it keeps a terminal, a pty and a dock tab for the rest of the
+// day, and `loods run cancel` would end the bookkeeping while the sessions
+// carry on. The job is what the session was for, so when the job is over the
+// session is too.
+//
+// A live run's orchestrator is left alone on purpose: it watches its run,
+// extends the graph while it goes, and is the session the user asks what
+// happened — being out of jobs for a moment is not being finished. It ends when
+// it decides it is done, or when the run is cancelled.
+//
+// Every live run is walked, and the finished ones too: the last job of a run
+// finishes the run in the same write, so by the time its session is over the
+// run is no longer live.
+func (s *Server) closeFinished() {
 	for _, r := range s.runs.All() {
-		if r.Status != run.Cancelled {
-			continue
-		}
 		for _, j := range r.Jobs {
-			if j.Status == run.JobCancelled && j.ProcID != "" {
-				s.stopIfAlive(j.ProcID)
+			if j.Over() && j.ProcID != "" {
+				s.closeSession(j.ProcID)
 			}
 		}
-		if r.Orchestrator != "" {
-			s.stopIfAlive(r.Orchestrator)
+		if r.Status == run.Cancelled && r.Orchestrator != "" {
+			s.closeSession(r.Orchestrator)
 		}
 	}
 }
 
-func (s *Server) stopIfAlive(procID string) {
-	if p, ok := s.procs.Find(procID); ok && p.Alive() {
+// closeSession asks a session to stop, once. A session that is already stopping
+// is left to the grace period Stop gave it: asking a second time means SIGKILL
+// now, and the pass two seconds later is no reason to kill an agent that is
+// still writing its last lines.
+func (s *Server) closeSession(procID string) {
+	if p, ok := s.procs.Find(procID); ok && p.Alive() && p.Status != proc.StatusStopping {
 		s.procs.Stop(procID)
 	}
 }
@@ -120,6 +138,11 @@ func sameRuns(a, b map[string]run.Run) bool {
 		}
 		for i := range x.Jobs {
 			if x.Jobs[i].Status != y.Jobs[i].Status || x.Jobs[i].Note != y.Jobs[i].Note {
+				return false
+			}
+			// A ticked step is the only thing that moves while a job runs, so
+			// without this the board would sit at the percentage it opened on.
+			if x.Jobs[i].StepsDone() != y.Jobs[i].StepsDone() {
 				return false
 			}
 		}

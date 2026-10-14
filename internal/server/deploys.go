@@ -52,6 +52,16 @@ func (s *Server) startDeploy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, d)
 }
 
+// stopIfAlive stops a process however far along it is, which is what a stop
+// button means: pressed twice on a deploy that is taking its time, the second
+// press is the one that insists. (Agent sessions are closed with closeSession
+// instead, which asks only once.)
+func (s *Server) stopIfAlive(procID string) {
+	if p, ok := s.procs.Find(procID); ok && p.Alive() {
+		s.procs.Stop(procID)
+	}
+}
+
 // deployAction is stop and rm. Both take the deploy offline; rm also forgets
 // the hostname.
 func (s *Server) deployAction(w http.ResponseWriter, r *http.Request) {

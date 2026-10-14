@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,13 +27,14 @@ const runUsage = `usage: loods run [-p group/project] [command]
   submit <run>        give a planning run its graph: --file jobs.yaml (or -)
   extend <run>        add jobs to a run that is already going (same format)
   status <run>        the run and its jobs (--watch to follow it)
+  step <run>:<job> <n>  step n of this job's checklist is done
   done <run>:<job>    this job finished: --note "what you did"
   fail <run>:<job>    this job could not finish: --note "why"
   cancel <run>        stop handing out work; running jobs are stopped too
 
-A graph is a YAML list of jobs, each with an id, a title and a prompt, and
-optionally needs: [other ids], role:, exclusive: repo, isolation: worktree
-and task: <n>:
+A graph is a YAML list of jobs, each with an id, a title, a prompt and a list
+of steps, and optionally needs: [other ids], role:, exclusive: repo,
+isolation: worktree, owns: [paths] and task: <n>:
 
   jobs:
     - id: stories
@@ -40,14 +42,38 @@ and task: <n>:
       title: Write the user stories
       prompt: |
         Write docs/userstories.md …
+      steps:
+        - List the user roles
+        - Write the stories of the first role
+        - Write the stories of the other roles
+        - Add acceptance criteria to every story
     - id: tickets
       needs: [stories]
       title: Turn the stories into tasks
       prompt: |
         Read docs/userstories.md and add one task per story …
+      steps:
+        - Read docs/userstories.md
+        - Add one task per story with 'loods todo add'
+        - Report the task numbers
+
+The steps are the job's checklist: the agent ticks one off with
+'loods run step <run>:<job> <n>' as it finishes it, and the board turns them
+into a percentage and a forecast of the time left. Keep them small and of
+roughly equal size — the steps a job has finished are what the forecast for the
+ones it has left is based on.
 
 loods starts a job as soon as everything it needs is done, up to --max-parallel
 sessions at a time, and never two jobs holding the same exclusive lock.
+
+owns: [paths] is the files a job is the only one allowed to change, as globs
+relative to the project ("src/lib/ui", "e2e/mobile-*.spec.ts", "docs/**"). Two
+jobs that can run at the same time and claim the same files are refused when
+the graph is submitted, which is the cheap moment to find out: a boundary that
+only lives in a design doc is one two lanes walk over, and the merge job pays
+for it. Jobs that wait for each other may share files — taking turns is what a
+sequence is for. A folder owns its whole subtree; a name with a dot in it is a
+file. The field is optional, and a job without it claims nothing.
 
 isolation: worktree gives a job a git worktree and a branch of its own
 (loods/<run>/<job>), so it can commit while another session commits in the
@@ -120,6 +146,12 @@ func runRun(env Env, args []string) error {
 			return err
 		}
 		return runStatus(runs, rest[0], f)
+	case "step":
+		if len(rest) != 2 {
+			fs.Usage()
+			return errors.New("step needs a job and a step number, like 4f2a1c:stories 2")
+		}
+		return runStep(runs, rest[0], rest[1], f)
 	case "done", "fail":
 		if err := one("job, like 4f2a1c:stories"); err != nil {
 			return err
@@ -272,6 +304,36 @@ func runStatus(runs *run.Store, id string, f runFlags) error {
 	}
 }
 
+// runStep is the one line a job agent runs as it works: step n is done. It
+// prints the job's own line back, so the agent sees the percentage it just
+// moved instead of the whole run.
+func runStep(runs *run.Store, ref, nth string, f runFlags) error {
+	runID, job, err := run.ParseRef(ref)
+	if err != nil {
+		return err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(nth))
+	if err != nil {
+		return fmt.Errorf("%q is not a step number", nth)
+	}
+	r, err := pick(runs, runID)
+	if err != nil {
+		return err
+	}
+	r, err = runs.Step(r.ID, job, n)
+	if err != nil {
+		return err
+	}
+	if f.asJSON {
+		return writeJSON(os.Stdout, r)
+	}
+	i, _ := r.JobIndex(job)
+	j := r.Jobs[i]
+	fmt.Printf("%s:%s  %s  %s\n", r.ID, job, progress(j, time.Now()), textfmt.Trim(j.Steps[n-1].Text, 60))
+	printSteps(os.Stdout, j)
+	return nil
+}
+
 func runFinish(runs *run.Store, cmd, ref string, f runFlags) error {
 	runID, job, err := run.ParseRef(ref)
 	if err != nil {
@@ -334,18 +396,69 @@ func readJobs(path string) ([]run.Job, error) {
 // printRun is the one view of a run: a header, then a line per job with why it
 // is waiting, so `status` and `--watch` show the same thing the Agents view does.
 func printRun(w io.Writer, r run.Run) {
-	fmt.Fprintf(w, "run %s  ·  %s  ·  %s  ·  %s\n", r.ID, textfmt.OrDash(r.Project), r.Status, tally(r))
+	now := time.Now()
+	fmt.Fprintf(w, "run %s  ·  %s  ·  %s  ·  %s%s\n",
+		r.ID, textfmt.OrDash(r.Project), r.Status, tally(r), left(r, now))
 	fmt.Fprintf(w, "goal:   %s\n", r.Goal)
 	if len(r.Jobs) == 0 {
 		fmt.Fprintf(w, "no jobs yet: `loods run submit %s --file jobs.yaml`\n", r.ID)
 		return
 	}
 	fmt.Fprintln(w, "jobs:")
-	now := time.Now()
 	for _, j := range r.Jobs {
-		fmt.Fprintf(w, "  %-12s %-10s %-9s %-6s %s\n",
-			textfmt.Trim(j.ID, 12), textfmt.Trim(j.Role, 10), j.Status, clock(j, now), why(r, j))
+		fmt.Fprintf(w, "  %-12s %-10s %-9s %-7s %-6s %s\n",
+			textfmt.Trim(j.ID, 12), textfmt.Trim(j.Role, 10), j.Status,
+			progress(j, now), clock(j, now), why(r, j))
+		printSteps(w, j)
 	}
+}
+
+// printSteps is the checklist under a job: a tick for what is done, so the
+// terminal shows the same thing the Agents view does. A job without a
+// checklist prints nothing extra.
+func printSteps(w io.Writer, j run.Job) {
+	for i, s := range j.Steps {
+		mark := " "
+		if s.Done {
+			mark = "✓"
+		}
+		fmt.Fprintf(w, "    %s %d. %s\n", mark, i+1, textfmt.Trim(s.Text, 70))
+	}
+}
+
+// progress is the job's percentage, and how much longer it is expected to
+// need. Both are forecasts from its own checklist: a job without one shows its
+// status only, which is all it ever told anybody.
+func progress(j run.Job, now time.Time) string {
+	if len(j.Steps) == 0 {
+		return ""
+	}
+	s := fmt.Sprintf("%d%%", int(j.Progress()*100+0.5))
+	if d, ok := j.ETA(now); ok {
+		s += " " + about(d)
+	}
+	return s
+}
+
+// about is a forecast as a reader should hear it: "~4m", but "<1m" on its own,
+// because the "<" is already the hedge the tilde is there for.
+func about(d time.Duration) string {
+	s := textfmt.Dur(d)
+	if strings.HasPrefix(s, "<") {
+		return s
+	}
+	return "~" + s
+}
+
+// left is the run's forecast, as the header's last field.
+func left(r run.Run, now time.Time) string {
+	if d, ok := r.ETA(now); ok {
+		return fmt.Sprintf("  ·  %d%% · %s left", int(r.Progress()*100+0.5), about(d))
+	}
+	if len(r.Jobs) > 0 && !r.Over() {
+		return fmt.Sprintf("  ·  %d%%", int(r.Progress()*100+0.5))
+	}
+	return ""
 }
 
 // why is the right-hand column: the note an agent left, or what the job is

@@ -25,6 +25,7 @@
 		startAgent,
 		startCommand,
 		startProject,
+		startRun,
 		cancelRun,
 		startStack,
 		subscribe,
@@ -132,6 +133,9 @@
 	// The + dialog: a name, what to build, and optionally a group folder.
 	let newProj = $state<{ name: string; goal: string; group: string } | null>(null);
 	let newBusy = $state(false);
+	// The same thing for a project that already exists: a goal for an
+	// orchestrator, from that project's own page.
+	let newRun = $state<{ p: Project; goal: string } | null>(null);
 	let detailOpen = $state(false);
 	let helpOpen = $state(false);
 	let picker = $state<{ project: Project; index: number } | null>(null);
@@ -668,6 +672,33 @@
 		}
 	}
 
+	/** O on a project page: hand this project's next goal to an orchestrator. */
+	function openOrchestrate(p: Project | null | undefined) {
+		if (p) newRun = { p, goal: plans[p.rel]?.next ?? '' };
+	}
+
+	// Starting a run on a project that exists is the + dialog without the
+	// folder: loods makes the run and the orchestrator session, and the Agents
+	// view is where you watch it, so that is where this lands you.
+	async function startOrchestrator() {
+		if (!newRun || newBusy) return;
+		const { p, goal } = newRun;
+		if (!goal.trim()) return flash('An orchestrator needs a goal: what should it build?', true);
+		newBusy = true;
+		try {
+			const run = await startRun(p.rel, goal.trim());
+			newRun = null;
+			selectedJob = `${run.id}:`;
+			view = 'agents';
+			if (run.orchestrator) showAgent(run.orchestrator);
+			flash(`✻ ${p.name}: an orchestrator is planning the work`);
+		} catch (e) {
+			flash((e as Error).message, true);
+		} finally {
+			newBusy = false;
+		}
+	}
+
 	// Cancelling asks first: it stops every session the run started, and an
 	// agent halfway through a commit is worth a confirmation.
 	function askCancelRun(r: AgentRun) {
@@ -1106,6 +1137,8 @@
 			case 'm':
 				statusPicker = project;
 				return;
+			case 'O':
+				return openOrchestrate(project);
 		}
 		return false;
 	}
@@ -1160,6 +1193,13 @@
 			if (e.key === 'Escape') newProj = null;
 			else if (e.key === 'Enter') createProject();
 			else return; // typing in the fields
+			e.preventDefault();
+			return;
+		}
+		if (newRun) {
+			if (e.key === 'Escape') newRun = null;
+			else if (e.key === 'Enter') startOrchestrator();
+			else return;
 			e.preventDefault();
 			return;
 		}
@@ -1226,6 +1266,7 @@
 		['s', 'sort by activity / priority / name', 'board'],
 		['esc', 'back to the board', 'project page'],
 		['1 – 3', 'Planboard · Garage · Git', 'project page'],
+		['O', 'hand a goal to an orchestrator: it plans jobs, agents build them', 'project page'],
 		['c · t · o · g', 'VS Code · terminal · folder · remote', 'board, project page'],
 		['r', 'run (asks when there are several commands)', 'board, project page'],
 		['x', 'stop everything of this project', 'board, project page'],
@@ -1429,6 +1470,7 @@
 			{taskSel}
 			claims={projectClaims}
 			agents={projectAgents}
+			runsLive={runList.filter((r) => r.project === project.rel && !runOver(r)).length}
 			{now}
 			{configPath}
 			ontab={(t) => (projectTab = t)}
@@ -1452,6 +1494,7 @@
 			onfix={(f) => fixFinding(project, f)}
 			ondelete={(branches, data) => deleteBranches(project, branches, data)}
 			onundo={() => undoGit(project)}
+			onorchestrate={() => openOrchestrate(project)}
 		/>
 	{:else}
 		<main><p class="empty">Loading project…</p></main>
@@ -1609,6 +1652,33 @@
 				<button onclick={() => (newProj = null)}>cancel</button>
 				<button class="go" onclick={createProject} disabled={newBusy}>
 					<kbd>enter</kbd> {newBusy ? 'creating…' : 'create and plan it'}
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
+{#if newRun}
+	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+	<div class="overlay" onclick={() => (newRun = null)}>
+		<div class="modal newp" onclick={(e) => e.stopPropagation()}>
+			<h2>Orchestrate {newRun.p.name}</h2>
+			<p class="intro">
+				An orchestrator is a Claude session whose job is to plan, not to build: it splits your goal into jobs
+				with a checklist each and hands them to loods, which runs them as agents — several at a time where they
+				do not depend on each other. Watch them in Agents (<kbd>4</kbd>).
+			</p>
+			<label class="wide">
+				<span>what to build</span>
+				<!-- svelte-ignore a11y_autofocus -->
+				<textarea bind:value={newRun.goal} rows="3" placeholder="add a deploy pipeline and smoke tests" autofocus
+				></textarea>
+			</label>
+			<div class="acts">
+				<p class="foot">{newRun.p.path}</p>
+				<button onclick={() => (newRun = null)}>cancel</button>
+				<button class="go" onclick={startOrchestrator} disabled={newBusy}>
+					<kbd>enter</kbd> {newBusy ? 'starting…' : 'plan and build it'}
 				</button>
 			</div>
 		</div>
